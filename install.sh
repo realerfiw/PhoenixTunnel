@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-13
+PHX_REV=standalone-14
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -390,26 +390,55 @@ prepare_tunnel_logs() (
 format_logs() {
     local color=false
     [[ ! -t 1 || ${TERM:-dumb} == dumb || -v NO_COLOR ]] || color=true
-    jq --unbuffered -Rr --argjson color "$color" '
+    jq --unbuffered -nRr --argjson color "$color" '
       def text: if type=="string" then . else tojson end;
       def safe: text | gsub("[\u0000-\u0008\u000b-\u001f\u007f]"; "") ;
       def redact: walk(if type=="object" then with_entries(
         if (.key|test("^(token|password|secret|authorization|private_key|connection_code|credential|credentials)$";"i"))
         then .value="[hidden]" else . end) else . end);
+      def fields($prefix):
+        if type=="object" and length>0 then to_entries[] |
+          .key as $key | .value | fields(if $prefix=="" then $key else $prefix+"."+$key end)
+        elif type=="array" and length>0 then to_entries[] |
+          .key as $key | .value | fields($prefix+"["+($key|tostring)+"]")
+        else ({mode:"Mode",carrier:"Transport",carrier_listen:"Listen",operations_listen:"Operations",
+          mappings:"Mappings",tcp_mappings:"TCP mappings",udp_mappings:"UDP mappings",agent_id:"Agent",
+          session_epoch:"Epoch",error:"Error",reason:"Reason",event:"Event",side:"Side",h2:"H2",h3:"H3"}[$prefix] // $prefix)
+          +": "+(safe|gsub("\n"; "\n               ")) end;
+      def pack:
+        reduce .[] as $field ([];
+          if length>0 and ((.[-1]|length)+($field|length)+3)<=105 then .[-1]+=" · "+$field
+          else .+[$field] end);
+      def display:
       . as $raw | (try fromjson catch {MESSAGE:$raw}) as $entry |
       (if ($entry|type)=="object" then $entry else {MESSAGE:$entry} end) as $j |
       (if $j|has("MESSAGE") then $j.MESSAGE else "" end) as $message |
       (if ($message|type)=="string" then (try ($message|fromjson) catch $message) else $message end | redact) as $body |
       (if ($body|type)=="object" then $body else {} end) as $o |
-      (try (($j.__REALTIME_TIMESTAMP|tonumber)/1000000|floor|strftime("%Y-%m-%d %H:%M:%S UTC")) catch "time unavailable") as $time |
+      (try (($j.__REALTIME_TIMESTAMP|tonumber)/1000000|floor|strftime("%Y-%m-%d %H:%M:%S")) catch "unknown date unknown time") as $time |
       (($o.level // (["ERROR","ERROR","ERROR","ERROR","WARN","NOTICE","INFO","DEBUG"][(try ($j.PRIORITY|tonumber) catch 6)] // "INFO"))|text|ascii_upcase|safe) as $level |
       (if $color then (if $level=="ERROR" then "\u001b[31m" elif $level=="WARN" then "\u001b[33m" else "\u001b[36m" end) else "" end) as $paint |
-      "\($time)  \($paint)\($level)\(if $color then "\u001b[0m" else "" end)  \(($j.SYSLOG_IDENTIFIER // $j._COMM // "phoenix")|safe)" ,
       (if ($body|type)=="object" then
-         (if $body|has("msg") then "  "+($body.msg|safe) else empty end),
-         ($body|to_entries[]|select(.key!="msg")|"  "+(.key|safe)+": "+(.value|safe))
-       else "  "+($body|safe) end),
-      (if $j|has("MESSAGE") then empty else "  journal: "+($j|redact|safe) end), ""
+         (if $body|has("msg") then $body.msg|safe else "Event" end)
+       else $body|safe end | gsub("\n"; "\n               ")) as $message |
+      ([if ($body|type)=="object" then
+           $body|to_entries[]|select(.key!="msg" and .key!="level")|
+           select(.key!="time" or (.value|type)!="string" or
+             (.value|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$")|not)) |
+           .key as $key | .value | fields($key)
+         else empty end,
+         if $j|has("MESSAGE") then empty else $j|redact|fields("journal") end,
+         ($j.SYSLOG_IDENTIFIER // $j._COMM // "phoenix") as $source |
+           if $source=="phoenix" or $source=="systemd" then empty else "Source: "+($source|safe) end] | pack) as $details |
+      ("\($time[11:])  \($paint)\($level)\(if $color then "\u001b[0m" else "" end)  \($message)") as $header |
+      {day:$time[0:10], lines:
+        (if ($details|length)>0 and (($header|length)+($details[0]|length))<125 and ($message|contains("\n")|not)
+         then [$header+" · "+$details[0]]+($details[1:]|map("               "+.))
+         else [$header]+($details|map("               "+.)) end)};
+      foreach inputs as $input ({day:null,lines:[]};
+        ($input|display) as $row |
+        {day:$row.day,lines:((if .day!=$row.day then [$row.day+" · UTC"] else [] end)+$row.lines)};
+        .lines[])
     '
 }
 show_logs() {

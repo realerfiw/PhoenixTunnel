@@ -92,7 +92,11 @@ configurations cause an explicit error before restarting the selected tunnel.
 history and follows new entries. Both include older default-journal entries for
 the selected service. UTC dates, levels, messages and all application fields
 are formatted without event allowlists, priority filters or line-count limits.
-Unknown events, plain text and nested metrics are retained in the display.
+Events use compact single-line headings with details wrapped underneath and no
+blank rows between records. The UTC date appears when it changes; redundant
+application timestamp/level fields are not printed twice. Unknown events,
+plain text and nested metrics are retained, with nested fields expanded into
+readable paths instead of a long JSON blob.
 Recognized structured secret fields are masked, and terminal control characters
 are sanitized; stored journal records are not rewritten. Do not share logs
 publicly without reviewing them for sensitive data.
