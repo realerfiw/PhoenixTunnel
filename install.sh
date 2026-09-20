@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-26
+PHX_REV=standalone-27
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -34,7 +34,6 @@ quiet_package_step() (
     local log result=0
     log=$(mktemp /tmp/phoenix-packages.XXXXXXXX) || return 1
     trap 'rm -f -- "$log"' EXIT
-    trap '' INT
     trap 'exit 143' TERM
     "$@" > "$log" 2>&1 || result=$?
     if ((result != 0)); then
@@ -105,7 +104,7 @@ confirm() {
     done
 }
 menu_ask() { ask "$@"; }
-pause() ( trap '' INT; local ignored; ask 'Press Enter to return...' ignored || :; )
+pause() ( local ignored; ask 'Press Enter to return...' ignored || :; )
 invalid_choice() {
     notice 33 "${1:-Invalid option.}"
     sleep 2
@@ -302,7 +301,6 @@ lock_action() {
     # Called as a direct command, not in an if/|| context: errexit applies inside.
     (
         set -e
-        trap '' INT
         trap 'exit 143' TERM
         # util-linux may be missing on a minimal host; bootstrap only on Install.
         if [[ ${1:-} == install_core ]] && ! command -v flock >/dev/null 2>&1; then
@@ -704,8 +702,7 @@ format_logs() {
         .lines[])
     '
 }
-show_logs() (
-    trap 'exit 130' INT
+show_logs() {
     local unit=$1 live=${2:-false}
     local -a options=(--no-pager --all --output=json --unit="$unit")
     need journalctl jq || return 1
@@ -719,9 +716,13 @@ show_logs() (
     fi
     [[ $live != true ]] || notice 37 'Press Ctrl+C to return'
     local result=0
-    journalctl "${options[@]}" | format_logs || result=$?
+    # Only while displaying logs does Ctrl+C return instead of closing the script.
+    trap ':' INT
+    (trap 'exit 130' INT; journalctl "${options[@]}" | format_logs) || result=$?
+    trap - INT
+    ((result != 130)) || return 130
     ((result == 0)) || { fail 'Unable to read or format journal logs.'; return "$result"; }
-)
+}
 write_unit() {
     local name=$1 mode=$2 output=$3 prefix="$PHX_BASE/configs/$1"
     printf '%s\n' '# PHOENIX_STANDALONE_UNIT_V1' '[Unit]' "Description=Phoenix Tunnel $name"         'Wants=network-online.target' 'After=network-online.target'         'StartLimitIntervalSec=60' 'StartLimitBurst=10' '' '[Service]'         'Type=simple' 'User=root' 'UMask=0077'         "EnvironmentFile=$prefix.env" "ExecStart=$(core) $mode --config $prefix.json"         'Restart=on-failure' 'RestartSec=3' 'TimeoutStopSec=10'         'LimitNOFILE=65536' 'NoNewPrivileges=true' 'PrivateTmp=true'         'ProtectSystem=strict' 'ProtectHome=true' 'PrivateDevices=true'         'ProtectKernelTunables=true' 'ProtectKernelModules=true' 'ProtectControlGroups=true'         'RestrictAddressFamilies=AF_INET AF_INET6' 'RestrictSUIDSGID=true'         'CapabilityBoundingSet=CAP_NET_BIND_SERVICE'         'LogRateLimitIntervalSec=30s' 'LogRateLimitBurst=200'         '' '[Install]' 'WantedBy=multi-user.target' > "$output"
@@ -753,7 +754,6 @@ commit_tunnel() (
         exit "$result"
     }
     trap rollback_creation EXIT
-    trap '' INT
     trap 'exit 143' TERM
     # All paths are generated locally. Incoming codes cannot set file paths or units.
     if [[ $mode == server ]]; then
@@ -1119,24 +1119,25 @@ manage_menu() {
             2) lock_action manage_action restart ;;
             3) lock_action manage_action stop ;;
             4) lock_action manage_action remove ;;
-            5) (trap '' INT; set -e; manage_action logs) ;;
-            6) (trap '' INT; set -e; manage_action live) ;;
-            7) (trap '' INT; set -e; manage_action details) ;;
-            8) (trap '' INT; set -e; manage_action check) ;;
-            9) (trap '' INT; set -e; manage_action status) ;;
-            10) (trap '' INT; set -e; manage_action code) ;;
+            5) manage_action logs ;;
+            6) manage_action live ;;
+            7) (set -e; manage_action details) ;;
+            8) (set -e; manage_action check) ;;
+            9) (set -e; manage_action status) ;;
+            10) (set -e; manage_action code) ;;
             *) invalid_choice; continue ;;
         esac
         action_status=$?
         # All cancelled actions return directly; real failures still get a pause.
-        if ((action_status == 130)); then continue; fi
+        if ((action_status == 130)); then
+            if [[ $choice == 5 || $choice == 6 ]]; then continue; fi
+            exit 130
+        fi
         ((action_status == 2)) || pause
     done
 }
-menu() (
+menu() {
     local choice action_status
-    # Navigation and mutations ignore Ctrl+C. Only show_logs enables SIGINT.
-    trap '' INT
     while :; do
         if core_ready; then refresh_release_status; fi
         heading 'Phoenix Tunnel Menu'
@@ -1156,7 +1157,7 @@ menu() (
             *) invalid_choice ;;
         esac
     done
-)
+}
 main() {
     [[ $# == 0 ]] || { fail 'Run without arguments to open the menu.'; return 1; }
     [[ $(uname -s) == Linux && $EUID == 0 ]] || { fail 'Run with Bash as root on Linux.'; return 1; }
