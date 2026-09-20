@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-11
+PHX_REV=standalone-12
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
@@ -25,7 +25,7 @@ option() {
     [[ $1 != 0 ]] || color=31
     paint "$color" "  $1)"; printf ' %s\n' "$2"
 }
-separator() { notice 36 '========================================='; }
+separator() { printf '\n'; }
 fail() { printf 'Phoenix: %s\n' "$*" >&2; return 1; }
 need() { local c; for c; do command -v "$c" >/dev/null || { fail "Required command: $c"; return 1; }; done; }
 ca_ready() { [[ -s /etc/ssl/certs/ca-certificates.crt ]]; }
@@ -103,7 +103,7 @@ confirm() {
         esac
     done
 }
-pause() { local ignored; ask 'Press Enter to continue...' ignored || :; }
+pause() { local ignored; ask 'Press Enter to return...' ignored || :; }
 clear_screen() {
     # Do not put terminal control bytes into redirected logs or test output.
     if [[ -t 1 && -n ${TERM:-} && ${TERM:-} != dumb ]]; then
@@ -113,9 +113,16 @@ clear_screen() {
 }
 heading() {
     clear_screen
-    separator
-    notice '1;37' "$1"
-    separator
+    local title=$1 line=''
+    printf -v line '%*s' "$(( ${#title} + 4 ))" ''
+    if [[ ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} == *[Uu][Tt][Ff]* ]]; then
+        paint 36 '╭─ '; paint '1;37' "$title"; paint 36 ' ─╮'; printf '\n'
+        paint 36 "╰${line// /─}╯"; printf '\n'
+    else
+        paint 36 "+${line// /-}+"; printf '\n'
+        paint '1;37' "|  $title  |"; printf '\n'
+        paint 36 "+${line// /-}+"; printf '\n'
+    fi
     printf '\n'
 }
 valid_host() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$ || $1 =~ ^\[[0-9a-fA-F:]+\]$ ]]; }
@@ -148,9 +155,9 @@ ask_iran_address() {
     local detected=''
     detected=$(detect_public_ip) || detected=''
     if [[ -n $detected ]]; then
-        ask "Iran public IP / hostname [$detected]: " host "$detected" || return 1
+        ask "Public IP [$detected]: " host "$detected" || return 1
     else
-        ask 'Iran public IP / hostname: ' host || return 1
+        ask 'Public IP: ' host || return 1
     fi
     valid_host "$host" || { fail 'Invalid IP / hostname.'; return 1; }
 }
@@ -356,17 +363,17 @@ create_iran() {
     ask 'Tunnel port [7845]: ' port 7845 || return
     valid_port "$port" || { fail 'Invalid port.'; return 1; }
     port=$((10#$port))
-    ask 'Carrier (auto/h2/h3) [auto]: ' carrier auto || return
+    ask 'Transport (auto/h2/h3) [auto]: ' carrier auto || return
     [[ $carrier == auto || $carrier == h2 || $carrier == h3 ]] || return 1
     connection_available iran "$port" || return 1
     automatic_name iran "$carrier" "$port" || return 1
     while :; do
-        ask 'Forward protocol (tcp/udp) [tcp]: ' protocol tcp || return
+        ask 'Protocol (tcp/udp) [tcp]: ' protocol tcp || return
         [[ $protocol == tcp || $protocol == udp ]] || return 1
         [[ $carrier != h3 || $protocol == udp ]] || { fail 'Use auto/h2 for TCP in this setup.'; return 1; }
-        ask 'Public port on Iran: ' listen || return
-        ask 'Target IP on Kharej [127.0.0.1]: ' target_host 127.0.0.1 || return
-        ask 'Target port on Kharej: ' target_port || return
+        ask 'Iran public port: ' listen || return
+        ask 'Kharej target IP [127.0.0.1]: ' target_host 127.0.0.1 || return
+        ask 'Kharej target port: ' target_port || return
         valid_port "$listen" && valid_port "$target_port" && valid_host "$target_host" || { fail 'Invalid mapping.'; return 1; }
         listen=$((10#$listen)); target_port=$((10#$target_port))
         [[ $listen != "$port" ]] || { fail 'Public port must differ from tunnel port.'; return 1; }
@@ -418,7 +425,7 @@ create_kharej() {
     need jq openssl base32 systemctl install chmod mktemp
     require_core; layout; safe_dir "$PHX_UNITS"
     local name code tmp carrier port address agent
-    ask 'Paste Iran connection code: ' code || return
+    ask 'Connection code: ' code || return
     tmp=$(mktemp -d "$PHX_BASE/configs/.setup.XXXXXXXX"); chmod 0700 "$tmp"
     PHX_TEMP=$tmp; trap 'rm -rf -- "$PHX_TEMP"' EXIT
     umask 077
@@ -524,7 +531,7 @@ select_tunnel() {
     option 0 'Back'
     printf '\n'
     while :; do
-        ask 'Enter tunnel number: ' choice || return 1
+        ask 'Select tunnel (0 Back): ' choice || return 1
         [[ $choice != 0 ]] || return 2
         if [[ $choice =~ ^[0-9]{1,5}$ ]] && ((10#$choice>0 && 10#$choice<=${#tunnel_names[@]})); then
             selected=${tunnel_names[10#$choice-1]}
@@ -605,7 +612,7 @@ remove_core() {
     for file in "$PHX_UNITS"/phoenix-standalone-*.service; do
         [[ ! -e $file ]] || { fail 'Remove standalone tunnels first.'; return 1; }
     done
-    confirm 'Remove Phoenix core files?' || return 0
+    confirm 'Remove Phoenix core?' || return 0
     rm -f -- "$(core)" "$PHX_BASE/core/LICENSE" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"
     # Never recursively delete configs, the saved menu, or shared OS packages.
     for file in "$PHX_BASE/core" "$PHX_BASE/configs" "$PHX_BASE"; do
@@ -637,7 +644,7 @@ manage_menu() {
         option 10 'Kharej connection code'
         option 0 'Back'
         printf '\n'
-        ask '-> Please select an option: ' choice || return
+        ask 'Select option: ' choice || return
         case $choice in
             0) return ;;
             1)
@@ -646,7 +653,7 @@ manage_menu() {
                 option 2 'Kharej (client)'
                 option 0 'Back'
                 printf '\n'
-                ask '-> Please select tunnel role: ' role || return
+                ask 'Select role (1 Iran / 2 Kharej / 0 Back): ' role || return
                 case $role in
                     1) lock_action create_iran ;;
                     2) lock_action create_kharej ;;
@@ -679,7 +686,7 @@ menu() {
         option 3 'Remove core'
         option 0 'Exit'
         printf '\n'
-        ask '-> Please select an option: ' choice || return 0
+        ask 'Select option: ' choice || return 0
         case $choice in
             0|4) return 0 ;;
             1) lock_action install_core; pause ;;
