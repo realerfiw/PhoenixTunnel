@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-20
+PHX_REV=standalone-21
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -268,30 +268,12 @@ version_key() {
 }
 refresh_release_status() {
     local latest=''
-    # Private temporary state belongs to this menu process, never /opt configs.
-    [[ -n ${PHX_RELEASE_CACHE:-} ]] || return 0
-    if [[ -f $PHX_RELEASE_CACHE/result ]]; then
-        IFS= read -r latest < "$PHX_RELEASE_CACHE/result" || :
-        PHX_LATEST_CORE=''
-        if release_version_valid "$latest"; then PHX_LATEST_CORE=$latest; fi
-        rm -f -- "$PHX_RELEASE_CACHE/result"
-        if [[ -n ${PHX_RELEASE_PID:-} ]]; then wait "$PHX_RELEASE_PID" 2>/dev/null || :; fi
-        PHX_RELEASE_PID=''
-    fi
-    if [[ -n ${PHX_RELEASE_PID:-} ]] && ! kill -0 "$PHX_RELEASE_PID" 2>/dev/null; then
-        wait "$PHX_RELEASE_PID" 2>/dev/null || :
-        PHX_RELEASE_PID=''
-    fi
-    if [[ -z ${PHX_RELEASE_PID:-} ]] && { [[ ! -v PHX_RELEASE_CHECKED ]] || ((SECONDS - PHX_RELEASE_CHECKED >= 300)); }; then
+    # Resolve before rendering. HTTPS lookup is bounded to two seconds.
+    if [[ ! -v PHX_RELEASE_CHECKED ]] || ((SECONDS - PHX_RELEASE_CHECKED >= 300)); then
         PHX_RELEASE_CHECKED=$SECONDS
         PHX_LATEST_CORE=''
-        (
-            trap - EXIT INT TERM
-            latest=$(latest_core_release) || latest=''
-            printf '%s\n' "$latest" > "$PHX_RELEASE_CACHE/pending"
-            mv -f -- "$PHX_RELEASE_CACHE/pending" "$PHX_RELEASE_CACHE/result"
-        ) </dev/null >/dev/null 2>&1 &
-        PHX_RELEASE_PID=$!
+        latest=$(latest_core_release) || latest=''
+        if release_version_valid "$latest"; then PHX_LATEST_CORE=$latest; fi
     fi
 }
 core_status() {
@@ -300,7 +282,6 @@ core_status() {
     local installed latest label=Unknown color=33 newest
     installed=${PHX_CORE_INSTALLED:-}
     refresh_release_status
-    [[ -z ${PHX_RELEASE_PID:-} ]] || label=Checking
     latest=${PHX_LATEST_CORE:-}
     if [[ -n $latest ]]; then
         if [[ $installed == "$latest" ]]; then label=Latest; color=32
@@ -1121,19 +1102,8 @@ manage_menu() {
 }
 menu() (
     local choice
-    PHX_RELEASE_CACHE=$(mktemp -d /tmp/phoenix-release.XXXXXXXX) || PHX_RELEASE_CACHE=''
-    cleanup_release_check() {
-        if [[ -n ${PHX_RELEASE_PID:-} ]]; then
-            # The network request is bounded to two seconds; reap it before cleanup.
-            wait "$PHX_RELEASE_PID" 2>/dev/null || :
-        fi
-        if [[ -n $PHX_RELEASE_CACHE ]]; then
-            rm -f -- "$PHX_RELEASE_CACHE/pending" "$PHX_RELEASE_CACHE/result"
-            rmdir -- "$PHX_RELEASE_CACHE" 2>/dev/null || :
-        fi
-    }
-    trap cleanup_release_check EXIT
     while :; do
+        if core_ready; then refresh_release_status; fi
         heading 'Phoenix Tunnel Menu'
         core_status
         separator
