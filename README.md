@@ -44,5 +44,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/realerfiw/PhoenixTunnel/main
 ```
 
 The installer detects the host architecture, verifies the downloaded core with
-`SHA256SUMS`, and installs it as `/opt/tunnel-manager/cores/phoenix`. It does
-not create, remove, start, stop, or restart any tunnel service.
+`SHA256SUMS`, and installs it as `/opt/phoenix-tunnel/phoenix`. It does not
+create, remove, start, stop, or restart any tunnel service.
