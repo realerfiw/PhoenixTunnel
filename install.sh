@@ -2,7 +2,8 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-12
+PHX_REV=standalone-13
+PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
@@ -326,9 +327,108 @@ write_config() {
                 server_name:"phoenix.internal",ca_file:($prefix+".crt")}} end)
     ' "$payload" > "$output"
 }
+log_settings() {
+    printf '%s\n' 'LogNamespace=phoenix-standalone' 'StandardOutput=journal' 'StandardError=journal' 'LogRateLimitIntervalSec=0' 'LogRateLimitBurst=0'
+}
+log_policy() {
+    printf '%s\n' '# PHOENIX_STANDALONE_JOURNAL_V1' '[Journal]' \
+        'Storage=persistent' 'Compress=yes' 'SystemMaxUse=100M' 'RuntimeMaxUse=20M' \
+        'SystemMaxFileSize=8M' 'RuntimeMaxFileSize=4M' 'MaxRetentionSec=3day' \
+        'MaxFileSec=1day' 'RateLimitIntervalSec=0' 'RateLimitBurst=0' \
+        'ForwardToSyslog=no' 'ForwardToKMsg=no' 'ForwardToConsole=no' 'ForwardToWall=no'
+}
+log_support() {
+    local version
+    version=$(systemctl --version) || return 1
+    version=${version#systemd }; version=${version%% *}; version=${version%%$'\n'*}
+    [[ $version =~ ^[0-9]+$ ]] && ((version >= 245)) || { fail 'Log retention requires systemd 245 or newer.'; return 1; }
+    systemctl cat systemd-journald@.service >/dev/null 2>&1 || { fail 'Journal namespaces are unavailable.'; return 1; }
+}
+prepare_log_policy() (
+    set -e
+    log_support || exit 1
+    local directory="$PHX_JOURNAL_ROOT/journald@phoenix-standalone.conf.d" file path staged
+    file="$directory/60-phoenix-retention.conf"
+    # Refuse unknown namespace overrides instead of claiming a cap they can defeat.
+    for path in "$PHX_JOURNAL_ROOT/journald@phoenix-standalone.conf" \
+        /run/systemd/journald@phoenix-standalone.conf /usr/local/lib/systemd/journald@phoenix-standalone.conf /usr/lib/systemd/journald@phoenix-standalone.conf \
+        "$directory"/*.conf /run/systemd/journald@phoenix-standalone.conf.d/*.conf \
+        /usr/local/lib/systemd/journald@phoenix-standalone.conf.d/*.conf /usr/lib/systemd/journald@phoenix-standalone.conf.d/*.conf; do
+        [[ ! -e $path && ! -L $path ]] && continue
+        [[ $path == "$file" && -f $path && ! -L $path ]] || { fail 'Custom Phoenix journal policy needs review.'; exit 1; }
+        [[ $(cat "$path") == "$(log_policy)" ]] || { fail 'Custom Phoenix journal policy needs review.'; exit 1; }
+    done
+    safe_dir "$PHX_JOURNAL_ROOT" || exit 1
+    safe_dir "$directory" || exit 1
+    if [[ ! -f $file ]]; then
+        staged=$(mktemp "$directory/.policy.XXXXXXXX") || exit 1
+        trap 'rm -f -- "$staged"' EXIT
+        log_policy > "$staged" || exit 1
+        chmod 0644 "$staged" || exit 1
+        mv -fT -- "$staged" "$file" || exit 1
+    fi
+)
+prepare_tunnel_logs() (
+    set -e
+    local name=$1 unit file staged
+    owned "$name" || { fail 'Cannot update logging for a modified service.'; exit 1; }
+    prepare_log_policy || exit 1
+    unit=$(unit_name "$name"); file="$PHX_UNITS/$unit"
+    if grep -qx 'LogNamespace=phoenix-standalone' "$file"; then exit 0; fi
+    if grep -Eq '^[[:space:]]*(LogNamespace|StandardOutput|StandardError)[[:space:]]*=' "$file"; then
+        fail 'Custom service logging needs review.'; exit 1
+    fi
+    staged=$(mktemp "$PHX_UNITS/.phoenix-log.XXXXXXXX") || exit 1
+    trap 'rm -f -- "$staged"' EXIT
+    cat "$file" > "$staged" || exit 1
+    printf '\n[Service]\n' >> "$staged" || exit 1
+    log_settings >> "$staged" || exit 1
+    chmod 0644 "$staged" || exit 1
+    mv -fT -- "$staged" "$file" || exit 1
+    systemctl daemon-reload || exit 1
+)
+format_logs() {
+    local color=false
+    [[ ! -t 1 || ${TERM:-dumb} == dumb || -v NO_COLOR ]] || color=true
+    jq --unbuffered -Rr --argjson color "$color" '
+      def text: if type=="string" then . else tojson end;
+      def safe: text | gsub("[\u0000-\u0008\u000b-\u001f\u007f]"; "") ;
+      def redact: walk(if type=="object" then with_entries(
+        if (.key|test("^(token|password|secret|authorization|private_key|connection_code|credential|credentials)$";"i"))
+        then .value="[hidden]" else . end) else . end);
+      . as $raw | (try fromjson catch {MESSAGE:$raw}) as $entry |
+      (if ($entry|type)=="object" then $entry else {MESSAGE:$entry} end) as $j |
+      (if $j|has("MESSAGE") then $j.MESSAGE else "" end) as $message |
+      (if ($message|type)=="string" then (try ($message|fromjson) catch $message) else $message end | redact) as $body |
+      (if ($body|type)=="object" then $body else {} end) as $o |
+      (try (($j.__REALTIME_TIMESTAMP|tonumber)/1000000|floor|strftime("%Y-%m-%d %H:%M:%S UTC")) catch "time unavailable") as $time |
+      (($o.level // (["ERROR","ERROR","ERROR","ERROR","WARN","NOTICE","INFO","DEBUG"][(try ($j.PRIORITY|tonumber) catch 6)] // "INFO"))|text|ascii_upcase|safe) as $level |
+      (if $color then (if $level=="ERROR" then "\u001b[31m" elif $level=="WARN" then "\u001b[33m" else "\u001b[36m" end) else "" end) as $paint |
+      "\($time)  \($paint)\($level)\(if $color then "\u001b[0m" else "" end)  \(($j.SYSLOG_IDENTIFIER // $j._COMM // "phoenix")|safe)" ,
+      (if ($body|type)=="object" then
+         (if $body|has("msg") then "  "+($body.msg|safe) else empty end),
+         ($body|to_entries[]|select(.key!="msg")|"  "+(.key|safe)+": "+(.value|safe))
+       else "  "+($body|safe) end),
+      (if $j|has("MESSAGE") then empty else "  journal: "+($j|redact|safe) end), ""
+    '
+}
+show_logs() {
+    local unit=$1 live=${2:-false}
+    local -a options=(--no-pager --all --no-tail --output=json --unit="$unit")
+    need journalctl jq || return 1
+    if journalctl --help | grep -q -- --namespace; then options+=(--namespace=+phoenix-standalone); fi
+    [[ $live != true ]] || options+=(--follow)
+    notice 37 'All retained entries · UTC'
+    [[ $live != true ]] || notice 37 'Press Ctrl+C to return'
+    local result=0
+    journalctl "${options[@]}" | format_logs || result=$?
+    ((result == 0)) || { fail 'Unable to read or format journal logs.'; return "$result"; }
+}
 write_unit() {
     local name=$1 mode=$2 output=$3 prefix="$PHX_BASE/configs/$1"
     printf '%s\n' '# PHOENIX_STANDALONE_UNIT_V1' '[Unit]' "Description=Phoenix Tunnel $name"         'Wants=network-online.target' 'After=network-online.target'         'StartLimitIntervalSec=60' 'StartLimitBurst=10' '' '[Service]'         'Type=simple' 'User=root' 'UMask=0077'         "EnvironmentFile=$prefix.env" "ExecStart=$(core) $mode --config $prefix.json"         'Restart=on-failure' 'RestartSec=3' 'TimeoutStopSec=10'         'LimitNOFILE=65536' 'NoNewPrivileges=true' 'PrivateTmp=true'         'ProtectSystem=strict' 'ProtectHome=true' 'PrivateDevices=true'         'ProtectKernelTunables=true' 'ProtectKernelModules=true' 'ProtectControlGroups=true'         'RestrictAddressFamilies=AF_INET AF_INET6' 'RestrictSUIDSGID=true'         'CapabilityBoundingSet=CAP_NET_BIND_SERVICE'         'LogRateLimitIntervalSec=30s' 'LogRateLimitBurst=200'         '' '[Install]' 'WantedBy=multi-user.target' > "$output"
+    printf '\n[Service]\n' >> "$output"
+    log_settings >> "$output"
 }
 commit_tunnel() {
     local mode=$1 name=$2 tmp=$3 suffix unit
@@ -336,6 +436,7 @@ commit_tunnel() {
     # All paths are generated locally. Incoming codes cannot set file paths or units.
     write_config "$mode" "$tmp/payload" "$tmp/tls" "$tmp/validate.json"
     "$(core)" validate --mode "$mode" --config "$tmp/validate.json" --environment "$tmp/config.env"
+    prepare_log_policy || return 1
     write_config "$mode" "$tmp/payload" "$PHX_BASE/configs/$name" "$tmp/config.json"
     write_unit "$name" "$mode" "$tmp/service"
     for suffix in json env; do install -m 0600 "$tmp/config.$suffix" "$PHX_BASE/configs/$name.$suffix"; done
@@ -556,6 +657,7 @@ manage_action() {
     notice 37 "Tunnel: $unit"
     case $action in
         restart|stop)
+            if [[ $action == restart ]]; then prepare_tunnel_logs "$selected" || return 1; fi
             systemctl "$action" "$unit"
             notice 32 "$selected: $action completed." ;;
         remove)
@@ -570,8 +672,8 @@ manage_action() {
             done
             systemctl daemon-reload
             notice 32 'Tunnel removed.' ;;
-        logs) journalctl --no-pager -n 80 -u "$unit" ;;
-        live) notice 37 'Press Ctrl+C to return to previous menu'; journalctl --no-pager -n 20 -f -u "$unit" ;;
+        logs) show_logs "$unit" ;;
+        live) show_logs "$unit" true ;;
         status) systemctl --no-pager --full status "$unit" ;;
         details)
             need jq

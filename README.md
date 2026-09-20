@@ -73,3 +73,32 @@ the saved menu and non-empty configuration directories are kept.
 Keep connection codes private. The destination service must be running on
 Kharej, and the selected transport and public ports must be allowed by your
 firewall. Existing installations at other paths are left unchanged.
+
+## Logs
+
+New tunnels use a dedicated `phoenix-standalone` journal namespace. For existing
+standalone tunnels, choose **Restart tunnel** once to apply the policy; this
+briefly interrupts that tunnel, without replacing its configuration.
+
+All standalone Phoenix tunnels on one host share a 100 MiB persistent journal
+budget and three-day retention (20 MiB for runtime storage). Rotation removes
+old entries automatically. Active files and journal overhead mean this is not
+an exact byte-level quota or an exact deletion deadline. System-wide journals
+and old entries in the default journal are not purged or capped by this policy.
+Namespace support requires systemd 245 or newer; unsupported/custom logging
+configurations cause an explicit error before restarting the selected tunnel.
+
+**View logs** displays all retained entries; **View live logs** displays the same
+history and follows new entries. Both include older default-journal entries for
+the selected service. UTC dates, levels, messages and all application fields
+are formatted without event allowlists, priority filters or line-count limits.
+Unknown events, plain text and nested metrics are retained in the display.
+Recognized structured secret fields are masked, and terminal control characters
+are sanitized; stored journal records are not rewritten. Do not share logs
+publicly without reviewing them for sensitive data.
+
+No duplicate text-log file is created. The dedicated retention policy remains
+after core removal so retained logs continue to age out; OS packages and other
+services are not changed. Records already expired, never emitted by the core,
+or previously suppressed cannot be recovered. Service-level rate suppression
+is disabled for migrated/new tunnels; disk/time retention still applies.
