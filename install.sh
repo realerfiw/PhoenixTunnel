@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-23
+PHX_REV=standalone-24
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -376,6 +376,15 @@ install_core() {
         [[ ! -L $destination && ( ! -e $destination || -f $destination ) ]] ||
             { fail "Unsafe core destination: $destination"; return 1; }
     done
+    if core_ready && [[ $PHX_CORE_INSTALLED == "${PHX_VERSION#v}" ]] &&
+        printf '%s  %s\n' "$digest" "$(core)" \
+          4ac2246b8a312640bc5da2a3d57c81dec1bfe813d2b2e5884883aaf95e753de7 "$PHX_BASE/core/LICENSE" \
+          d8fe863575b7eab50193c578392aadb8c3c6c6c6a312f2548b084e27588cb5f1 "$PHX_BASE/core/THIRD-PARTY-LICENSES.json" |
+          sha256sum --check --strict --quiet - 2>/dev/null; then
+        notice 32 "Phoenix ${PHX_VERSION#v} already installed and verified."
+        report_restart_needed
+        return 0
+    fi
     tmp=$(mktemp -d "$PHX_BASE/core/.download.XXXXXXXX")
     PHX_TEMP=$tmp; trap 'rm -rf -- "$PHX_TEMP"' EXIT
     asset=phoenix-linux-$arch
@@ -394,13 +403,25 @@ install_core() {
     install -m 0644 "$tmp/LICENSE" "$PHX_BASE/core/LICENSE"
     install -m 0644 "$tmp/THIRD-PARTY-LICENSES.json" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"
     notice 32 "Phoenix ${PHX_VERSION#v} installed."
-    local unit
-    for unit in "$PHX_UNITS"/phoenix-standalone-*.service; do
-        if [[ -f $unit ]]; then
-            notice 33 'Restart existing tunnels to use the updated core.'
-            break
+    report_restart_needed
+}
+running_core_changed() {
+    local pid=$1 disk running
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+    disk=$(stat -Lc '%d:%i' -- "$(core)" 2>/dev/null) || return 1
+    running=$(stat -Lc '%d:%i' -- "/proc/$pid/exe" 2>/dev/null) || return 1
+    [[ $disk != "$running" ]]
+}
+report_restart_needed() {
+    local -a tunnel_names=() tunnel_states=()
+    local index
+    collect_tunnels
+    for ((index=0; index<${#tunnel_names[@]}; index++)); do
+        if [[ ${tunnel_states[index]} == UP_RESTART ]]; then
+            notice 33 "Restart required: $(unit_name "${tunnel_names[index]}")"
         fi
     done
+    return 0
 }
 automatic_name() {
     local role=$1 carrier=$2 port=$3 suffix candidate state
@@ -878,6 +899,147 @@ create_kharej() {
     notice 36 'Creating tunnel...'
     commit_tunnel client "$name" "$tmp"
 }
+edit_identity_matches() {
+    local payload=$1 name=$2
+    jq -e --slurpfile cfg "$PHX_BASE/configs/$name.json" \
+      --rawfile env "$PHX_BASE/configs/$name.env" --rawfile cert "$PHX_BASE/configs/$name.crt" '
+      $cfg[0] as $c |
+      .carrier==$c.carrier and (.ca|sub("[\\r\\n]+$";""))==($cert|sub("[\\r\\n]+$";"")) and
+      ($env|rtrimstr("\n"))==("PHOENIX_TOKEN="+.token) and
+      (if $c.mode=="server" then
+        .agent==$c.auth.agent_credentials[0].agent_id and
+        (.port|tostring)==($c.server.carrier_listen|split(":")|last) and .mappings==$c.mappings
+       else .agent==$c.auth.agent_id and (.host+":"+(.port|tostring))==$c.client.server_address end)
+    ' "$payload" >/dev/null
+}
+edit_tunnel() (
+    set -e
+    # Subshell-private state must survive function unwinding for the EXIT trap.
+    name=$1; prefix="$PHX_BASE/configs/$1"
+    unit=''; mode=''; tmp=''; code=''; choice=''; index=0; count=0; suffix=''
+    protocol=''; listen=''; target_host=''; target_port=''; carrier=''; port=''; mappings=''; n=0
+    active=false; applied=false; complete=false
+    unit=$(unit_name "$name")
+    require_core
+    owned "$name" || exit 1
+    safe_dir "$PHX_BASE/configs"
+    for suffix in json env crt; do
+        [[ -f $prefix.$suffix && ! -L $prefix.$suffix ]] || { fail 'Unsafe or incomplete tunnel files.'; exit 1; }
+    done
+    mode=$(jq -r .mode "$prefix.json")
+    [[ $mode == server || $mode == client ]] || exit 1
+    if [[ $mode == server ]]; then
+        [[ -f $prefix.code && ! -L $prefix.code ]] || { fail 'Iran connection code is missing or unsafe.'; exit 1; }
+    fi
+    tmp=$(mktemp -d "$PHX_BASE/configs/.edit.XXXXXXXX")
+    chmod 0700 "$tmp"
+    edit_cleanup() {
+        local result=$? failed=false
+        trap - EXIT
+        trap '' INT TERM
+        if [[ $applied == true && $complete != true ]]; then
+            mv -fT -- "$tmp/original.json" "$prefix.json" || failed=true
+            if [[ $mode == server ]]; then mv -fT -- "$tmp/original.code" "$prefix.code" || failed=true; fi
+            if [[ $active == true && $failed == false ]]; then
+                systemctl restart "$unit" && systemctl is-active --quiet "$unit" || failed=true
+            fi
+            if [[ $failed == true ]]; then
+                fail "Recovery needs review: $unit. Private recovery files retained at $tmp."
+                exit 1
+            fi
+            notice 33 'Edit cancelled or failed; previous configuration restored.'
+        fi
+        rm -rf -- "$tmp"
+        exit "$result"
+    }
+    trap edit_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    umask 077
+    cp -- "$prefix.json" "$tmp/original.json"
+    if [[ $mode == server ]]; then
+        cp -- "$prefix.code" "$tmp/original.code"
+        decode_code "$(<"$prefix.code")" "$tmp/payload"
+        edit_identity_matches "$tmp/payload" "$name" || { fail 'Saved code does not match this tunnel. No changes made.'; exit 1; }
+        mappings=$(jq -c .mappings "$prefix.json")
+        carrier=$(jq -r .carrier "$prefix.json")
+        port=$(jq -r '.port|tostring' "$tmp/payload")
+        while :; do
+            heading 'Edit Iran ports'
+            jq -r 'to_entries[]|"  \(.key+1)) \(.value.protocol) \(.value.listen) -> \(.value.target)"' <<< "$mappings"
+            separator
+            option 1 'Add port'; option 2 'Remove port'; option 3 'Apply changes'; option 0 'Back'
+            ask 'Select option: ' choice || exit
+            case $choice in
+                0) exit 0 ;;
+                1)
+                    count=$(jq length <<< "$mappings")
+                    if ((count >= 64)); then notice 33 'At most 64 ports.'; continue; fi
+                    if [[ $carrier == h3 ]]; then protocol=udp
+                    else ask_choice 'Protocol (tcp/udp) [tcp]: ' protocol tcp 'tcp udp' || exit; fi
+                    ask_mapping_port || exit 1
+                    ask_host 'Kharej target IP [127.0.0.1]: ' target_host 127.0.0.1 || exit
+                    while :; do
+                        ask 'Kharej target port: ' target_port || exit
+                        valid_port "$target_port" && break
+                        notice 33 'Invalid port. Enter a port from 1 to 65535.'
+                    done
+                    target_port=$((10#$target_port)); n=1
+                    while jq -e --arg name "port$n" 'any(.[];.name==$name)' <<< "$mappings" >/dev/null; do n=$((n+1)); done
+                    mappings=$(jq -c --arg name "port$n" --arg p "$protocol" --arg l "0.0.0.0:$listen" --arg t "$target_host:$target_port" '.+[{name:$name,protocol:$p,listen:$l,target:$t}]' <<< "$mappings") ;;
+                2)
+                    count=$(jq length <<< "$mappings")
+                    if ((count <= 1)); then notice 33 'Keep at least one port; use Remove tunnel to delete the tunnel.'; continue; fi
+                    ask 'Port number (0 Back): ' index || exit
+                    [[ $index != 0 ]] || continue
+                    if [[ ! $index =~ ^[0-9]{1,2}$ ]] || ((10#$index<1 || 10#$index>count)); then invalid_choice; continue; fi
+                    mappings=$(jq -c --argjson i "$((10#$index-1))" 'del(.[$i])' <<< "$mappings") ;;
+                3) break ;;
+                *) invalid_choice ;;
+            esac
+        done
+        jq --argjson mappings "$mappings" '.mappings=$mappings' "$tmp/payload" > "$tmp/new-payload"
+        mv -fT "$tmp/new-payload" "$tmp/payload"
+        { printf PHX1; jq -c . "$tmp/payload" | base32 -w0 | tr -d '='; printf '\n'; } > "$tmp/new.code"
+        if (($(wc -c < "$tmp/new.code") > 32769)); then fail 'Too many ports for a transferable connection code.'; exit 1; fi
+    else
+        ask 'Updated Iran connection code: ' code || exit
+        decode_code "$code" "$tmp/payload"
+        edit_identity_matches "$tmp/payload" "$name" || { fail 'Code belongs to a different tunnel. No changes made.'; exit 1; }
+    fi
+    jq --slurpfile payload "$tmp/payload" '.mappings=$payload[0].mappings' "$prefix.json" > "$tmp/new.json"
+    if [[ $(jq -Sc . "$tmp/new.json") == "$(jq -Sc . "$prefix.json")" ]]; then notice 37 'No changes.'; exit 0; fi
+    "$(core)" validate --config "$tmp/new.json" --environment "$prefix.env"
+    jq -r '.mappings[]|"  \(.protocol) \(.listen) -> \(.target)"' "$tmp/new.json"
+    notice 33 'Apply on both sides. Running tunnel restarts briefly; stopped tunnel stays stopped.'
+    confirm 'Apply port changes?' || exit 0
+    owned "$name" || exit 1
+    [[ $(<"$prefix.json") == "$(<"$tmp/original.json")" ]] || { fail 'Configuration changed while editing.'; exit 1; }
+    if [[ $mode == server ]]; then
+        [[ $(<"$prefix.code") == "$(<"$tmp/original.code")" ]] || exit 1
+        while IFS=$'\t' read -r protocol listen; do
+            # Existing mappings keep their sockets; only newly added listeners need a free port.
+            if ! jq -e --arg p "$protocol" --arg l "$listen" 'any(.mappings[];.protocol==$p and .listen==$l)' "$prefix.json" >/dev/null; then
+                mapping_port_available "$protocol" "${listen##*:}" || { fail "Port $listen is no longer available."; exit 1; }
+            fi
+        done < <(jq -r '.mappings[]|[.protocol,.listen]|@tsv' "$tmp/new.json")
+    fi
+    local state
+    state=$(systemctl show "$unit" -p ActiveState --value) || exit 1
+    case $state in active) active=true ;; inactive|failed) active=false ;; *) fail 'Service is changing state; retry later.'; exit 1 ;; esac
+    chmod 0600 "$tmp/new.json"
+    applied=true
+    mv -fT -- "$tmp/new.json" "$prefix.json"
+    if [[ $mode == server ]]; then chmod 0600 "$tmp/new.code"; mv -fT -- "$tmp/new.code" "$prefix.code"; fi
+    if [[ $active == true ]]; then systemctl restart "$unit"; systemctl is-active --quiet "$unit"; fi
+    complete=true
+    notice 32 'Ports updated. Service identity and credentials unchanged.'
+    if [[ $mode == server ]]; then
+        notice 33 'On the matching Kharej tunnel choose Edit ports and paste this updated private code:'
+        cat "$prefix.code"
+    fi
+    exit 0
+)
 owned_files() {
     local name=$1 unit
     [[ $name =~ ^(iran|kharej)-[a-z][a-z0-9-]{0,31}$ ]] || return 1
@@ -899,7 +1061,7 @@ owned() {
 collect_tunnels() {
     # Display-only snapshot: one systemd query for the whole screen. Actions
     # revalidate ownership separately; a status label is never authorization.
-    local path name unit snapshot key value id='' active='' load='' fragment='' drops='' index
+    local path name unit snapshot key value id='' active='' load='' fragment='' drops='' pid='' index
     local -a units=()
     local -A indexes=()
     tunnel_names=(); tunnel_states=()
@@ -916,7 +1078,7 @@ collect_tunnels() {
         else tunnel_states+=(INCOMPLETE); fi
     done
     ((${#units[@]})) || return 0
-    snapshot=$(systemctl show --no-pager --property=Id,LoadState,ActiveState,FragmentPath,DropInPaths -- "${units[@]}" 2>/dev/null) || return 0
+    snapshot=$(systemctl show --no-pager --property=Id,LoadState,ActiveState,FragmentPath,DropInPaths,MainPID -- "${units[@]}" 2>/dev/null) || return 0
     while IFS='=' read -r key value; do
         case $key in
             Id) id=$value ;;
@@ -924,18 +1086,21 @@ collect_tunnels() {
             LoadState) load=$value ;;
             FragmentPath) fragment=$value ;;
             DropInPaths) drops=$value ;;
+            MainPID) pid=$value ;;
             '')
                 if [[ $id =~ ^phoenix-standalone-(iran|kharej)-[a-z][a-z0-9-]{0,31}\.service$ && -v indexes[$id] ]]; then
                     index=${indexes[$id]}
                     if [[ ${tunnel_states[index]} != INCOMPLETE && $load == loaded && $fragment == "$PHX_UNITS/$id" && -z $drops ]]; then
                         case $active in
-                            active) tunnel_states[index]=UP ;;
+                            active)
+                                tunnel_states[index]=UP
+                                if running_core_changed "$pid"; then tunnel_states[index]=UP_RESTART; fi ;;
                             inactive|failed) tunnel_states[index]=DOWN ;;
                             *) tunnel_states[index]=UNKNOWN ;;
                         esac
                     fi
                 fi
-                id=''; active=''; load=''; fragment=''; drops='' ;;
+                id=''; active=''; load=''; fragment=''; drops=''; pid='' ;;
         esac
     done <<< "$snapshot"$'\n'
 }
@@ -948,7 +1113,7 @@ render_tunnels() {
     fi
     for ((index=0; index<${#tunnel_names[@]}; index++)); do
         state=${tunnel_states[index]}
-        case $state in UP) label='RUNNING' ;; DOWN) label='STOPPED' ;; *) label=$state ;; esac
+        case $state in UP) label='RUNNING' ;; UP_RESTART) label='RUNNING · Restart required' ;; DOWN) label='STOPPED' ;; *) label=$state ;; esac
         case $state in UP) color=32 ;; DOWN) color=31 ;; *) color=33 ;; esac
         paint 35 "  $((index+1))) "
         paint 33 "$(unit_name "${tunnel_names[index]}")"
@@ -989,7 +1154,7 @@ manage_action() {
         remove) title='Remove Phoenix Tunnel' ;; logs) title='Phoenix Tunnel Logs' ;;
         live) title='Live Phoenix Tunnel Logs' ;; details) title='Phoenix Tunnel Details' ;;
         check) title='Phoenix Health Check' ;; status) title='Phoenix Tunnel Status' ;;
-        code) title='Kharej Connection Code' ;; *) return 1 ;;
+        code) title='Kharej Connection Code' ;; edit) title='Edit Phoenix Ports' ;; *) return 1 ;;
     esac
     select_tunnel "$title" || { result=$?; [[ $result != 2 ]] || return 2; return 0; }
     owned "$selected" || { fail 'Tunnel configuration changed or needs review. No action taken.'; return 1; }
@@ -997,6 +1162,7 @@ manage_action() {
     separator
     notice 37 "Tunnel: $unit"
     case $action in
+        edit) edit_tunnel "$selected" ;;
         restart|stop)
             if [[ $action == restart ]]; then prepare_tunnel_logs "$selected" || return 1; fi
             systemctl "$action" "$unit"
@@ -1082,6 +1248,7 @@ manage_menu() {
         option 8 'Health Check'
         option 9 'Status'
         option 10 'Kharej connection code'
+        option 11 'Edit ports'
         option 0 'Back'
         printf '\n'
         menu_ask 'Select option: ' choice || return
@@ -1113,6 +1280,7 @@ manage_menu() {
             8) (trap 'exit 130' INT; set -e; manage_action check) ;;
             9) (trap 'exit 130' INT; set -e; manage_action status) ;;
             10) (trap 'exit 130' INT; set -e; manage_action code) ;;
+            11) lock_action manage_action edit ;;
             *) invalid_choice; continue ;;
         esac
         action_status=$?
