@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-25
+PHX_REV=standalone-26
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -967,7 +967,6 @@ render_tunnels() {
         paint 33 "$(unit_name "${tunnel_names[index]}")"
         printf ' ['; paint "$color" "$label"; printf ']\n'
     done
-    notice 37 'Service state only; connection is not verified.'
 }
 select_tunnel() {
     heading "${1:-Select Phoenix tunnel}"
