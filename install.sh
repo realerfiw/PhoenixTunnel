@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-16
+PHX_REV=standalone-17
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -182,8 +182,52 @@ safe_dir() {
 layout() { safe_dir "$PHX_BASE" && safe_dir "$PHX_BASE/core" && safe_dir "$PHX_BASE/configs"; }
 core() { printf '%s/core/phoenix' "$PHX_BASE"; }
 core_ready() { [[ -f $(core) && ! -L $(core) && -x $(core) ]]; }
+release_version_valid() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+(-dev\.[0-9]+)?$ ]]; }
+latest_core_release() {
+    # /latest excludes development releases. Never download a core from this response.
+    curl --proto '=https' -fsS --connect-timeout 1 --max-time 2 --max-filesize 262144 \
+        'https://api.github.com/repos/realerfiw/PhoenixTunnel/releases?per_page=30' 2>/dev/null |
+        jq -er '[.[] | select(.draft == false) | select(.tag_name | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+(-dev\\.[0-9]+)?$"))] | sort_by(.published_at) | last | .tag_name | ltrimstr("v")' 2>/dev/null
+}
+version_key() {
+    local version=$1 main=${1%%-*} stable=1 dev=0
+    if [[ $version == *-dev.* ]]; then stable=0; dev=${version##*.}; fi
+    printf '%s.%s.%s\n' "$main" "$stable" "$dev"
+}
 core_status() {
-    if core_ready; then notice 32 'Core: Installed'; else notice 33 'Core: Not installed'; fi
+    if ! core_ready; then notice 33 'Core: Not installed'; return; fi
+    local signature output installed latest label=Unknown color=33 newest
+    signature=$(stat -c '%d:%i:%s:%y:%z' -- "$(core)" 2>/dev/null) || signature=''
+    if [[ -z $signature || $signature != "${PHX_CORE_SIGNATURE:-}" ]]; then
+        PHX_CORE_SIGNATURE=$signature
+        PHX_CORE_INSTALLED=''
+        output=$(timeout 2 "$(core)" version 2>/dev/null) || output=''
+        if [[ $output =~ ^phoenix[[:space:]]+v?([^[:space:]]+) ]]; then
+            installed=${BASH_REMATCH[1]}
+            release_version_valid "$installed" && PHX_CORE_INSTALLED=$installed
+        fi
+    fi
+    installed=${PHX_CORE_INSTALLED:-}
+    if [[ -z $installed ]]; then notice 33 'Core: Installed · Version unknown'; return; fi
+    if [[ ! -v PHX_RELEASE_CHECKED ]] || ((SECONDS - PHX_RELEASE_CHECKED >= 300)); then
+        PHX_RELEASE_CHECKED=$SECONDS
+        PHX_LATEST_CORE=''
+        latest=$(latest_core_release) || latest=''
+        release_version_valid "$latest" && PHX_LATEST_CORE=$latest
+    fi
+    latest=${PHX_LATEST_CORE:-}
+    if [[ -n $latest ]]; then
+        if [[ $installed == "$latest" ]]; then label=Latest; color=32
+        else
+            newest=$(printf '%s\n%s\n' "$(version_key "$installed")" "$(version_key "$latest")" | sort -V | tail -n 1)
+            if [[ $newest == "$(version_key "$latest")" ]]; then
+                label="Update available: $latest"
+                [[ $latest == "${PHX_VERSION#v}" ]] || label+=' (update menu first)'
+            else label='Newer than latest'; color=36
+            fi
+        fi
+    fi
+    notice "$color" "Core: Installed · $installed · $label"
 }
 require_core() { core_ready || { fail 'Choose Install core first.'; return 1; }; }
 lock_action() {
