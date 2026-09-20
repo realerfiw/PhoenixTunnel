@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-3
+PHX_REV=standalone-4
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
@@ -45,17 +45,15 @@ pause() { local ignored; ask 'Press Enter to continue...' ignored || :; }
 clear_screen() {
     # Do not put terminal control bytes into redirected logs or test output.
     if [[ -t 1 && -n ${TERM:-} && ${TERM:-} != dumb ]]; then
-        printf '\033[2J\033[H'
+        # Clear old screen AND scrollback so earlier menu statuses cannot linger.
+        printf '\033[0m\033[2J\033[H\033[3J'
     fi
 }
 heading() {
     clear_screen
-    printf '\n'
     notice 36 '--------------------------------------------'
-    notice '1;36' 'PHOENIX TUNNEL'
-    notice 37 "$1"
+    notice '1;36' "$1"
     notice 36 '--------------------------------------------'
-    printf '\n'
 }
 valid_name() { [[ $1 =~ ^[a-z][a-z0-9-]{0,31}$ ]]; }
 valid_host() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$ || $1 =~ ^\[[0-9a-fA-F:]+\]$ ]]; }
@@ -75,6 +73,9 @@ safe_dir() {
 layout() { safe_dir "$PHX_BASE" && safe_dir "$PHX_BASE/core" && safe_dir "$PHX_BASE/configs"; }
 core() { printf '%s/core/phoenix' "$PHX_BASE"; }
 core_ready() { [[ -f $(core) && ! -L $(core) && -x $(core) ]]; }
+core_status() {
+    if core_ready; then notice 32 'Core: Installed'; else notice 33 'Core: Not installed'; fi
+}
 require_core() { core_ready || { fail 'Choose Install core first.'; return 1; }; }
 lock_action() {
     # Called as a direct command, not in an if/|| context: errexit applies inside.
@@ -311,7 +312,7 @@ owned() {
     [[ $(systemctl show "$unit" -p FragmentPath --value) == "$PHX_UNITS/$unit" ]] || return 1
 }
 select_tunnel() {
-    heading 'Select Phoenix tunnel'
+    heading "${1:-Select Phoenix tunnel}"
     need systemctl || return
     local path name n=0 choice
     local -a names=()
@@ -329,11 +330,11 @@ select_tunnel() {
 }
 manage_action() {
     local action=$1 selected unit mode suffix
-    select_tunnel || return 0
-    heading "Phoenix tunnel: $action"
+    select_tunnel "Phoenix tunnel: $action" || return 0
+    notice 36 "Tunnel: $selected"
     unit=$(unit_name "$selected")
     case $action in
-        restart|stop|start)
+        restart|stop)
             systemctl "$action" "$unit"
             notice 32 "$selected: $action completed." ;;
         remove)
@@ -384,24 +385,23 @@ manage_menu() {
             return 0
         fi
         heading 'Phoenix Tunnel Management'
+        core_status
+        printf '\n'
         option 1 'Create tunnel'
         option 2 'Restart tunnel'
         option 3 'Stop tunnel'
         option 4 'Remove tunnel'
-        printf '\n'
         option 5 'View logs'
         option 6 'View live logs'
         option 7 'View tunnel details'
         option 8 'Health check'
         option 9 'Status'
         option 10 'Kharej connection code'
-        option 11 'Start stopped tunnel'
-        printf '\n'
-        option 12 'Back'
+        option 0 'Back'
         printf '\n'
         ask '  Select an option: ' choice || return
         case $choice in
-            0|12) return ;;
+            0) return ;;
             1)
                 heading 'Create Phoenix tunnel'
                 option 1 'Iran (server)'
@@ -424,7 +424,6 @@ manage_menu() {
             8) (set -e; manage_action check) ;;
             9) (set -e; manage_action status) ;;
             10) (set -e; manage_action code) ;;
-            11) lock_action manage_action start ;;
             *) notice 33 'Invalid option.'; pause; continue ;;
         esac
         pause
@@ -434,12 +433,11 @@ menu() {
     local choice
     while :; do
         heading 'Phoenix Tunnel'
-        if core_ready; then notice 32 'Core: Installed'; else notice 33 'Core: Not installed'; fi
+        core_status
         printf '\n'
         option 1 'Install / update core'
         option 2 'Manage tunnels'
         option 3 'Remove core'
-        printf '\n'
         option 4 'Exit'
         printf '\n'
         ask '  Select an option: ' choice || return 0
