@@ -1,77 +1,391 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+# Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
+# PHOENIX_STANDALONE_MENU_V1
+set -uo pipefail
+PHX_REV=standalone-1
+PHX_VERSION=v0.1.0-dev.69
+PHX_BASE=/opt/phoenix-tunnel
+PHX_SAVE=/root/install.sh
+PHX_UNITS=/etc/systemd/system
+PHX_LOCK=/run/lock/phoenix-standalone.lock
+PHX_RAW=https://raw.githubusercontent.com/realerfiw/PhoenixTunnel/main/install.sh
+PHX_RELEASE=https://github.com/realerfiw/PhoenixTunnel/releases/download
+PHX_SOURCE=${BASH_SOURCE[0]}
 
-OWNER="realerfiw"
-REPOSITORY="PhoenixTunnel"
-VERSION="${PHOENIX_VERSION:-v0.1.0-dev.69}"
-INSTALL_DIR="${PHOENIX_INSTALL_DIR:-/opt/phoenix-tunnel}"
-BASE_URL="https://github.com/${OWNER}/${REPOSITORY}/releases/download/${VERSION}"
-INSTALLER_URL="https://raw.githubusercontent.com/${OWNER}/${REPOSITORY}/main/install.sh"
-
-if [ "$(id -u)" -ne 0 ]; then
-    echo "Phoenix installer must run as root." >&2
-    echo "Run: curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPOSITORY}/main/install.sh | sudo sh" >&2
-    exit 1
-fi
-
-for command_name in curl uname mktemp awk install; do
-    if ! command -v "$command_name" >/dev/null 2>&1; then
-        echo "Missing required command: $command_name" >&2
-        exit 1
-    fi
-done
-
-case "$(uname -m)" in
-    x86_64|amd64) ARCH="amd64" ;;
-    aarch64|arm64) ARCH="arm64" ;;
-    *)
-        echo "Unsupported Linux architecture: $(uname -m)" >&2
-        exit 1
-        ;;
-esac
-
-if command -v sha256sum >/dev/null 2>&1; then
-    CHECKSUM_TOOL="sha256sum"
-elif command -v shasum >/dev/null 2>&1; then
-    CHECKSUM_TOOL="shasum"
-else
-    echo "Missing checksum command: install sha256sum or shasum." >&2
-    exit 1
-fi
-
-ASSET="phoenix-linux-${ARCH}"
-TEMP_DIR="$(mktemp -d)"
-cleanup() {
-    rm -rf "$TEMP_DIR"
+fail() { printf 'Phoenix: %s\n' "$*" >&2; return 1; }
+need() { local c; for c; do command -v "$c" >/dev/null || { fail "Required command: $c"; return 1; }; done; }
+ask() {
+    local prompt=$1 default=${3:-}
+    printf '%s' "$prompt"
+    IFS= read -r "$2" || return 1
+    [[ ${!2} != :cancel ]] || return 1
+    [[ -n ${!2} ]] || printf -v "$2" '%s' "$default"
 }
-trap cleanup EXIT INT TERM
-
-echo "Downloading Phoenix Tunnel ${VERSION} (${ARCH})..."
-curl --fail --location --silent --show-error \
-    "${BASE_URL}/${ASSET}" --output "${TEMP_DIR}/${ASSET}"
-curl --fail --location --silent --show-error \
-    "${BASE_URL}/SHA256SUMS" --output "${TEMP_DIR}/SHA256SUMS"
-curl --fail --location --silent --show-error \
-    "$INSTALLER_URL" --output "${TEMP_DIR}/install.sh"
-
-EXPECTED_SHA="$(awk -v asset="$ASSET" '$2 == asset { print $1; exit }' "${TEMP_DIR}/SHA256SUMS")"
-if [ -z "$EXPECTED_SHA" ]; then
-    echo "No checksum found for ${ASSET}." >&2
-    exit 1
-fi
-
-echo "Verifying SHA-256..."
-if [ "$CHECKSUM_TOOL" = "sha256sum" ]; then
-    printf '%s  %s\n' "$EXPECTED_SHA" "${TEMP_DIR}/${ASSET}" | sha256sum -c -
-else
-    printf '%s  %s\n' "$EXPECTED_SHA" "${TEMP_DIR}/${ASSET}" | shasum -a 256 -c -
-fi
-
-mkdir -p "$INSTALL_DIR"
-install -m 0755 "${TEMP_DIR}/${ASSET}" "${INSTALL_DIR}/phoenix"
-install -m 0755 "${TEMP_DIR}/install.sh" "${INSTALL_DIR}/install.sh"
-
-echo "Installed: ${INSTALL_DIR}/phoenix"
-echo "Installer saved: ${INSTALL_DIR}/install.sh"
-"${INSTALL_DIR}/phoenix" version
-echo "Existing Phoenix services are not started or restarted by this installer."
+confirm() {
+    local answer
+    ask "$1 (Y/n): " answer y || return 1
+    [[ $answer == y || $answer == Y || $answer == yes ]]
+}
+pause() { local ignored; ask 'Press Enter to continue...' ignored || :; }
+heading() { printf '\n=========================================\n%s\n=========================================\n\n' "$1"; }
+valid_name() { [[ $1 =~ ^[a-z][a-z0-9-]{0,31}$ ]]; }
+valid_host() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$ || $1 =~ ^\[[0-9a-fA-F:]+\]$ ]]; }
+valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 <= 65535 )); }
+unit_name() { printf 'phoenix-standalone-%s.service' "$1"; }
+safe_dir() {
+    local path=$1
+    [[ $path == /* && $path != / && $path != *..* && $path != *[[:space:]%]* ]] || return 1
+    [[ $(realpath -m -- "$path") == "$path" ]] || { fail "Symlink or noncanonical path: $path"; return 1; }
+    if [[ -e $path ]]; then
+        [[ -d $path && $(stat -c %u "$path") == 0 ]] || return 1
+        (( (8#$(stat -c %a "$path") & 0022) == 0 )) || { fail "Directory is writable by others: $path"; return 1; }
+    else
+        install -d -m 0755 -- "$path" || return 1
+    fi
+}
+layout() { safe_dir "$PHX_BASE" && safe_dir "$PHX_BASE/core" && safe_dir "$PHX_BASE/configs"; }
+core() { printf '%s/core/phoenix' "$PHX_BASE"; }
+require_core() { [[ -f $(core) && ! -L $(core) && -x $(core) ]] || { fail 'Choose Install core first.'; return 1; }; }
+lock_action() {
+    # Called as a direct command, not in an if/|| context: errexit applies inside.
+    (
+        set -e
+        need flock
+        [[ ! -L $PHX_LOCK ]]
+        exec 9>"$PHX_LOCK"
+        flock -n 9 || { fail 'Another Phoenix operation is running.'; exit 1; }
+        "$@"
+    )
+}
+fetch() { curl --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 15 --max-time 180 --retry 2 "$1" -o "$2"; }
+save_menu() (
+    set -e
+    need realpath stat install mktemp curl
+    safe_dir "$(dirname "$PHX_SAVE")"
+    [[ ! -L $PHX_SAVE ]] || { fail 'Refusing a symlink at the saved script path.'; exit 1; }
+    if [[ -e $PHX_SAVE ]]; then
+        [[ -f $PHX_SAVE ]] && grep -q '^# PHOENIX_STANDALONE_MENU_V1$' "$PHX_SAVE" ||
+            { fail "$PHX_SAVE belongs to another script; it was not overwritten. Menu still available."; exit 1; }
+    fi
+    [[ $PHX_SOURCE != "$PHX_SAVE" ]] || exit 0
+    local staged
+    staged=$(mktemp "$(dirname "$PHX_SAVE")/.phoenix-menu.XXXXXXXX")
+    trap 'rm -f -- "$staged"' EXIT
+    if [[ -f $PHX_SOURCE && ! -L $PHX_SOURCE && $PHX_SOURCE != /dev/* && $PHX_SOURCE != /proc/* ]]; then
+        cp -- "$PHX_SOURCE" "$staged"
+    else
+        fetch "$PHX_RAW?revision=$PHX_REV" "$staged"
+    fi
+    grep -qx "# PHOENIX_STANDALONE_MENU_V1" "$staged"
+    grep -qx "PHX_REV=$PHX_REV" "$staged"
+    bash -n "$staged"
+    chmod 0755 "$staged"
+    mv -fT -- "$staged" "$PHX_SAVE"
+)
+install_core() {
+    need curl sha256sum install mktemp timeout
+    layout
+    local arch asset digest tmp reported destination
+    case $(uname -m) in
+        x86_64|amd64) arch=amd64; digest=e1504be2242ca00992541dd31367b5335238d27db938d232b0fc9cc33cce4764 ;;
+        aarch64|arm64) arch=arm64; digest=45a9265a1ab740a7d0f4f9278afee875bd6a7ca30606b23ec7be5141e3e3c871 ;;
+        *) fail 'Supported architectures: amd64, arm64'; return 1 ;;
+    esac
+    confirm "Install core ${PHX_VERSION#v} ($arch)?" || return 0
+    for destination in "$(core)" "$PHX_BASE/core/LICENSE" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"; do
+        [[ ! -L $destination && ( ! -e $destination || -f $destination ) ]] ||
+            { fail "Unsafe core destination: $destination"; return 1; }
+    done
+    tmp=$(mktemp -d "$PHX_BASE/core/.download.XXXXXXXX")
+    PHX_TEMP=$tmp; trap 'rm -rf -- "$PHX_TEMP"' EXIT
+    asset=phoenix-linux-$arch
+    printf 'Downloading Phoenix %s...\n' "$PHX_VERSION"
+    fetch "$PHX_RELEASE/$PHX_VERSION/$asset" "$tmp/phoenix"
+    printf '%s  %s\n' "$digest" "$tmp/phoenix" | sha256sum -c -
+    fetch "$PHX_RELEASE/$PHX_VERSION/LICENSE" "$tmp/LICENSE"
+    fetch "$PHX_RELEASE/$PHX_VERSION/THIRD-PARTY-LICENSES-linux-$arch.json" "$tmp/THIRD-PARTY-LICENSES.json"
+    printf '%s  %s\n' 4ac2246b8a312640bc5da2a3d57c81dec1bfe813d2b2e5884883aaf95e753de7 "$tmp/LICENSE" d8fe863575b7eab50193c578392aadb8c3c6c6c6a312f2548b084e27588cb5f1 "$tmp/THIRD-PARTY-LICENSES.json" | sha256sum -c -
+    chmod 0755 "$tmp/phoenix"
+    reported=$(timeout 10s "$tmp/phoenix" version)
+    [[ $reported == "phoenix ${PHX_VERSION#v} "* ]] || { fail 'Unexpected core version'; return 1; }
+    # Rename, never truncate an executable that an existing service may be using.
+    mv -fT "$tmp/phoenix" "$(core)"
+    install -m 0644 "$tmp/LICENSE" "$PHX_BASE/core/LICENSE"
+    install -m 0644 "$tmp/THIRD-PARTY-LICENSES.json" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"
+    printf '%s\nInstalled: %s\n' "$reported" "$(core)"
+    printf 'Existing tunnels keep running. Restart selected tunnels to use the new core.\n'
+}
+new_name() {
+    local label=$1
+    ask 'Tunnel name (letters, numbers, hyphens): ' name || return 1
+    valid_name "$name" || { fail 'Use 1-32 lowercase characters, starting with a letter.'; return 1; }
+    name="$label-$name"
+    local f
+    for f in "$PHX_BASE/configs/$name".*; do
+        [[ ! -e $f && ! -L $f ]] || { fail 'That tunnel name already exists.'; return 1; }
+    done
+    [[ ! -e "$PHX_UNITS/$(unit_name "$name")" && ! -L "$PHX_UNITS/$(unit_name "$name")" ]] ||
+        { fail 'Service already exists.'; return 1; }
+    [[ $(systemctl show "$(unit_name "$name")" -p LoadState --value) == not-found ]] ||
+        { fail 'A service with this name already exists.'; return 1; }
+}
+write_config() {
+    local mode=$1 payload=$2 prefix=$3 output=$4
+    jq --arg mode "$mode" --arg prefix "$prefix" '
+        {version:1, mode:$mode, carrier:.carrier,
+         limits:{carrier_max_age:"0s"},
+         mappings:.mappings,
+         auth:(if $mode=="server" then
+           {agent_credentials:[{agent_id:.agent,token_env:"PHOENIX_TOKEN"}]}
+           else {agent_id:.agent,token_env:"PHOENIX_TOKEN"} end)}
+         + (if $mode=="server" then
+             {server:{carrier_listen:("0.0.0.0:"+(.port|tostring)),
+                certificate_file:($prefix+".crt"),private_key_file:($prefix+".key")}}
+            else {client:{server_address:(.host+":"+(.port|tostring)),
+                server_name:"phoenix.internal",ca_file:($prefix+".crt")}} end)
+    ' "$payload" > "$output"
+}
+write_unit() {
+    local name=$1 mode=$2 output=$3 prefix="$PHX_BASE/configs/$1"
+    printf '%s\n' '# PHOENIX_STANDALONE_UNIT_V1' '[Unit]' "Description=Phoenix Tunnel $name"         'Wants=network-online.target' 'After=network-online.target'         'StartLimitIntervalSec=60' 'StartLimitBurst=10' '' '[Service]'         'Type=simple' 'User=root' 'UMask=0077'         "EnvironmentFile=$prefix.env" "ExecStart=$(core) $mode --config $prefix.json"         'Restart=on-failure' 'RestartSec=3' 'TimeoutStopSec=10'         'LimitNOFILE=65536' 'NoNewPrivileges=true' 'PrivateTmp=true'         'ProtectSystem=strict' 'ProtectHome=true' 'PrivateDevices=true'         'ProtectKernelTunables=true' 'ProtectKernelModules=true' 'ProtectControlGroups=true'         'RestrictAddressFamilies=AF_INET AF_INET6' 'RestrictSUIDSGID=true'         'CapabilityBoundingSet=CAP_NET_BIND_SERVICE'         'LogRateLimitIntervalSec=30s' 'LogRateLimitBurst=200'         '' '[Install]' 'WantedBy=multi-user.target' > "$output"
+}
+commit_tunnel() {
+    local mode=$1 name=$2 tmp=$3 suffix unit
+    unit=$(unit_name "$name")
+    # All paths are generated locally. Incoming codes cannot set file paths or units.
+    write_config "$mode" "$tmp/payload" "$tmp/tls" "$tmp/validate.json"
+    "$(core)" validate --mode "$mode" --config "$tmp/validate.json" --environment "$tmp/config.env"
+    write_config "$mode" "$tmp/payload" "$PHX_BASE/configs/$name" "$tmp/config.json"
+    write_unit "$name" "$mode" "$tmp/service"
+    for suffix in json env; do install -m 0600 "$tmp/config.$suffix" "$PHX_BASE/configs/$name.$suffix"; done
+    install -m 0600 "$tmp/tls.crt" "$PHX_BASE/configs/$name.crt"
+    if [[ $mode == server ]]; then
+        install -m 0600 "$tmp/tls.key" "$PHX_BASE/configs/$name.key"
+        install -m 0600 "$tmp/code" "$PHX_BASE/configs/$name.code"
+    fi
+    install -m 0644 "$tmp/service" "$PHX_UNITS/$unit"
+    systemctl daemon-reload
+    systemctl enable --now "$unit"
+    if ! systemctl is-active --quiet "$unit"; then
+        fail "Created $unit, but startup failed. Check View logs."; return 1
+    fi
+    printf 'Created: %s\n' "$unit"
+}
+create_iran() {
+    need jq openssl base32 tr systemctl timeout install chmod mktemp
+    require_core
+    layout
+    safe_dir "$PHX_UNITS"
+    local name host port carrier protocol listen target_host target_port more tmp agent token mappings='[]' count=0
+    new_name iran || return
+    ask 'Iran public IP / hostname: ' host || return
+    valid_host "$host" || { fail 'Invalid IP / hostname.'; return 1; }
+    ask 'Tunnel port [7845]: ' port 7845 || return
+    valid_port "$port" || { fail 'Invalid port.'; return 1; }
+    port=$((10#$port))
+    ask 'Carrier (auto/h2/h3) [auto]: ' carrier auto || return
+    [[ $carrier == auto || $carrier == h2 || $carrier == h3 ]] || return 1
+    while :; do
+        ask 'Forward protocol (tcp/udp) [tcp]: ' protocol tcp || return
+        [[ $protocol == tcp || $protocol == udp ]] || return 1
+        [[ $carrier != h3 || $protocol == udp ]] || { fail 'Use auto/h2 for TCP in this setup.'; return 1; }
+        ask 'Public port on Iran: ' listen || return
+        ask 'Target IP on Kharej [127.0.0.1]: ' target_host 127.0.0.1 || return
+        ask 'Target port on Kharej: ' target_port || return
+        valid_port "$listen" && valid_port "$target_port" && valid_host "$target_host" || { fail 'Invalid mapping.'; return 1; }
+        listen=$((10#$listen)); target_port=$((10#$target_port))
+        [[ $listen != "$port" ]] || { fail 'Public port must differ from tunnel port.'; return 1; }
+        count=$((count+1)); ((count<=64)) || { fail 'At most 64 mappings.'; return 1; }
+        mappings=$(printf '%s' "$mappings" | jq -c --arg name "port$count" --arg p "$protocol" --arg l "0.0.0.0:$listen" --arg t "$target_host:$target_port" '.+[{name:$name,protocol:$p,listen:$l,target:$t}]')
+        ask 'Add another port? (y/N): ' more n || return
+        [[ $more == y || $more == Y ]] || break
+    done
+    printf '\nIran: %s:%s | %s | %s mapping(s)\n' "$host" "$port" "$carrier" "$count"
+    printf 'Creates and starts this tunnel; enables startup after reboot. Firewall unchanged.\n'
+    confirm 'Create tunnel?' || return 0
+    tmp=$(mktemp -d "$PHX_BASE/configs/.setup.XXXXXXXX"); chmod 0700 "$tmp"
+    PHX_TEMP=$tmp; trap 'rm -rf -- "$PHX_TEMP"' EXIT
+    umask 077
+    agent=$(openssl rand -hex 16); token=$(openssl rand -hex 32)
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650         -subj /CN=phoenix.internal -addext subjectAltName=DNS:phoenix.internal         -keyout "$tmp/tls.key" -out "$tmp/tls.crt" >/dev/null 2>&1
+    # Secret values travel through stdin, never command-line arguments.
+    printf '%s\n' "$token" "$agent" "$host" "$port" "$carrier" "$mappings" |
+        jq -Rn --rawfile ca "$tmp/tls.crt"         '{v:1,token:input,agent:input,host:input,port:(input|tonumber),carrier:input,mappings:(input|fromjson),ca:$ca}' > "$tmp/payload"
+    printf 'PHOENIX_TOKEN=%s\n' "$token" > "$tmp/config.env"
+    { printf PHX1; jq -c . "$tmp/payload" | base32 -w0 | tr -d '='; printf '\n'; } > "$tmp/code"
+    commit_tunnel server "$name" "$tmp"
+    printf '\nKharej connection code (private):\n'; cat "$tmp/code"
+}
+decode_code() {
+    local code=$1 output=$2 raw padding
+    [[ ${#code} -le 32768 && $code =~ ^PHX1[A-Z2-7]+$ ]] || { fail 'Invalid Phoenix connection code.'; return 1; }
+    raw=${code#PHX1}; padding=$(( (8-${#raw}%8)%8 ))
+    printf -v raw '%s%*s' "$raw" "$padding" ''
+    printf '%s' "${raw// /=}" | base32 -d > "$output" || return 1
+    jq -e '
+      type=="object" and .v==1 and
+      (.token|type=="string" and test("^[0-9a-f]{64}$")) and
+      (.agent|type=="string" and test("^[0-9a-f]{32}$")) and
+      (.host|type=="string" and length<254 and test("^[A-Za-z0-9][A-Za-z0-9.-]*$|^\\[[0-9a-fA-F:]+\\]$")) and
+      (.port|type=="number" and floor==. and .>=1 and .<=65535) and
+      (.carrier=="auto" or .carrier=="h2" or .carrier=="h3") and
+      (.ca|type=="string" and length<8192 and startswith("-----BEGIN CERTIFICATE-----")) and
+      (.mappings|type=="array" and length>=1 and length<=64) and
+      all(.mappings[]; (keys|sort)==["listen","name","protocol","target"] and
+          (.name|type=="string" and test("^[a-zA-Z0-9-]{1,32}$")) and
+          (.protocol=="tcp" or .protocol=="udp") and
+          (.listen|type=="string" and length<300 and test("^[ -~]+$")) and
+          (.target|type=="string" and length<300 and test("^[ -~]+$")))
+    ' "$output" >/dev/null || { fail 'Invalid connection settings.'; return 1; }
+}
+create_kharej() {
+    need jq openssl base32 systemctl install chmod mktemp
+    require_core; layout; safe_dir "$PHX_UNITS"
+    local name code tmp
+    new_name kharej || return
+    ask 'Paste Iran connection code: ' code || return
+    tmp=$(mktemp -d "$PHX_BASE/configs/.setup.XXXXXXXX"); chmod 0700 "$tmp"
+    PHX_TEMP=$tmp; trap 'rm -rf -- "$PHX_TEMP"' EXIT
+    umask 077
+    decode_code "$code" "$tmp/payload"
+    jq -r .ca "$tmp/payload" > "$tmp/tls.crt"
+    openssl x509 -in "$tmp/tls.crt" -noout >/dev/null
+    jq -r '"PHOENIX_TOKEN="+.token' "$tmp/payload" > "$tmp/config.env"
+    printf '\n'; jq -r '"Iran: "+.host+":"+(.port|tostring), (.mappings[]|.protocol+" "+.listen+" -> "+.target)' "$tmp/payload"
+    printf 'Creates and starts this tunnel; enables startup after reboot.\n'
+    confirm 'Create tunnel?' || return 0
+    commit_tunnel client "$name" "$tmp"
+}
+owned() {
+    local name=$1 unit
+    [[ $name =~ ^(iran|kharej)-[a-z][a-z0-9-]{0,31}$ ]] || return 1
+    unit=$(unit_name "$name")
+    [[ -f "$PHX_UNITS/$unit" && ! -L "$PHX_UNITS/$unit" && ! -L "$PHX_BASE/configs/$name.json" ]] || return 1
+    grep -qx '# PHOENIX_STANDALONE_UNIT_V1' "$PHX_UNITS/$unit" || return 1
+    grep -Fqx "EnvironmentFile=$PHX_BASE/configs/$name.env" "$PHX_UNITS/$unit" || return 1
+    local mode=server; [[ $name == iran-* ]] || mode=client
+    grep -Fqx "ExecStart=$(core) $mode --config $PHX_BASE/configs/$name.json" "$PHX_UNITS/$unit" || return 1
+    # Drop-ins may redirect the executable; do not manage such a service.
+    [[ -z $(systemctl show "$unit" -p DropInPaths --value) ]] || return 1
+    [[ $(systemctl show "$unit" -p FragmentPath --value) == "$PHX_UNITS/$unit" ]] || return 1
+}
+select_tunnel() {
+    need systemctl || return
+    local path name n=0 choice
+    local -a names=()
+    for path in "$PHX_UNITS"/phoenix-standalone-*.service; do
+        [[ -f $path ]] || continue
+        name=${path##*/phoenix-standalone-}; name=${name%.service}
+        owned "$name" || continue
+        names+=("$name"); n=$((n+1))
+        printf '%s) %s [%s]\n' "$n" "$name" "$(systemctl is-active "$(unit_name "$name")" 2>/dev/null || :)"
+    done
+    ((n>0)) || { fail 'No standalone Phoenix tunnels found.'; return 1; }
+    ask 'Tunnel number (0 = back): ' choice || return
+    [[ $choice =~ ^[0-9]{1,3}$ ]] && ((10#$choice>0 && 10#$choice<=n)) || return 1
+    selected=${names[10#$choice-1]}
+}
+manage_action() {
+    local action=$1 selected unit mode suffix
+    select_tunnel || return 0
+    unit=$(unit_name "$selected")
+    case $action in
+        restart|stop|start)
+            confirm "$action $selected?" || return 0
+            systemctl "$action" "$unit" ;;
+        remove)
+            confirm "Remove $selected and its configuration?" || return 0
+            owned "$selected" || return 1
+            systemctl stop "$unit"
+            systemctl disable "$unit"
+            rm -- "$PHX_UNITS/$unit"
+            # Exact, generated filenames only. No recursive config deletion.
+            for suffix in json env crt key code; do
+                rm -f -- "$PHX_BASE/configs/$selected.$suffix"
+            done
+            systemctl daemon-reload
+            printf 'Removed: %s (no backup).\n' "$selected" ;;
+        logs) journalctl --no-pager -n 80 -u "$unit" ;;
+        live) journalctl --no-pager -n 20 -f -u "$unit" ;;
+        status) systemctl --no-pager --full status "$unit" ;;
+        details)
+            need jq
+            printf 'Service: %s\nConfig: %s/configs/%s.json\n' "$unit" "$PHX_BASE" "$selected"
+            jq '{mode,carrier,mappings,server:(.server//null),client:(.client//null)}' "$PHX_BASE/configs/$selected.json" ;;
+        check)
+            require_core
+            "$(core)" validate --config "$PHX_BASE/configs/$selected.json" --environment "$PHX_BASE/configs/$selected.env"
+            systemctl is-active "$unit" ;;
+        code)
+            [[ $selected == iran-* && -f "$PHX_BASE/configs/$selected.code" ]] || { fail 'Select an Iran tunnel to display its code.'; return 1; }
+            printf 'Private connection code:\n'; cat "$PHX_BASE/configs/$selected.code" ;;
+    esac
+}
+remove_core() {
+    layout
+    local file
+    for file in "$PHX_UNITS"/phoenix-standalone-*.service; do
+        [[ ! -e $file ]] || { fail 'Remove standalone tunnels first.'; return 1; }
+    done
+    confirm 'Remove Phoenix core?' || return 0
+    [[ ! -L $(core) ]] || return 1
+    rm -f -- "$(core)" "$PHX_BASE/core/LICENSE" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"
+    printf 'Core removed. Configurations and saved menu kept.\n'
+}
+manage_menu() {
+    local choice role
+    while :; do
+        heading 'Phoenix Tunnel Management'
+        printf '%s\n' '1) Create tunnel' '2) Restart tunnel' '3) Stop tunnel' '4) Remove tunnel'             '5) View logs' '6) View live logs' '7) View tunnel details' '8) Health check'             '9) Status' '10) Kharej connection code' '11) Start stopped tunnel' '0) Back'
+        ask 'Choice: ' choice || return
+        case $choice in
+            0) return ;;
+            1)
+                printf '\n1) Iran (server)\n2) Kharej (client)\n0) Back\n'
+                ask 'Role: ' role || return
+                case $role in
+                    1) lock_action create_iran ;;
+                    2) lock_action create_kharej ;;
+                    *) continue ;;
+                esac ;;
+            2) lock_action manage_action restart ;;
+            3) lock_action manage_action stop ;;
+            4) lock_action manage_action remove ;;
+            5) (set -e; manage_action logs) ;;
+            6) (trap 'exit 130' INT; set -e; manage_action live) ;;
+            7) (set -e; manage_action details) ;;
+            8) (set -e; manage_action check) ;;
+            9) (set -e; manage_action status) ;;
+            10) (set -e; manage_action code) ;;
+            11) lock_action manage_action start ;;
+            *) printf 'Invalid option.\n'; continue ;;
+        esac
+        pause
+    done
+}
+menu() {
+    local choice
+    while :; do
+        heading 'Phoenix Tunnel'
+        if [[ -x $(core) ]]; then printf 'Core: Installed\n'; else printf 'Core: Not installed\n'; fi
+        printf '\n1) Install / update core\n2) Manage tunnels\n3) Remove core\n0) Exit\n'
+        ask 'Choice: ' choice || return 0
+        case $choice in
+            0) return 0 ;;
+            1) lock_action install_core; pause ;;
+            2) manage_menu ;;
+            3) lock_action remove_core; pause ;;
+            *) printf 'Invalid option.\n' ;;
+        esac
+    done
+}
+main() {
+    [[ $# == 0 ]] || { fail 'Run without arguments to open the menu.'; return 1; }
+    [[ $(uname -s) == Linux && $EUID == 0 ]] || { fail 'Run with Bash as root on Linux.'; return 1; }
+    need realpath stat install mktemp || return
+    if [[ -e $PHX_BASE || -L $PHX_BASE ]]; then safe_dir "$PHX_BASE" || return 1; fi
+    # Saving the menu is the only startup write. No core/config/service mutation.
+    save_menu
+    menu
+}
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
