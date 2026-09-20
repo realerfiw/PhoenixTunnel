@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-1
+PHX_REV=standalone-2
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
@@ -27,7 +27,16 @@ confirm() {
     [[ $answer == y || $answer == Y || $answer == yes ]]
 }
 pause() { local ignored; ask 'Press Enter to continue...' ignored || :; }
-heading() { printf '\n=========================================\n%s\n=========================================\n\n' "$1"; }
+clear_screen() {
+    # Do not put terminal control bytes into redirected logs or test output.
+    if [[ -t 1 && -n ${TERM:-} && ${TERM:-} != dumb ]]; then
+        printf '\033[2J\033[H'
+    fi
+}
+heading() {
+    clear_screen
+    printf '\n=========================================\n%s\n=========================================\n\n' "$1"
+}
 valid_name() { [[ $1 =~ ^[a-z][a-z0-9-]{0,31}$ ]]; }
 valid_host() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$ || $1 =~ ^\[[0-9a-fA-F:]+\]$ ]]; }
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 <= 65535 )); }
@@ -45,7 +54,8 @@ safe_dir() {
 }
 layout() { safe_dir "$PHX_BASE" && safe_dir "$PHX_BASE/core" && safe_dir "$PHX_BASE/configs"; }
 core() { printf '%s/core/phoenix' "$PHX_BASE"; }
-require_core() { [[ -f $(core) && ! -L $(core) && -x $(core) ]] || { fail 'Choose Install core first.'; return 1; }; }
+core_ready() { [[ -f $(core) && ! -L $(core) && -x $(core) ]]; }
+require_core() { core_ready || { fail 'Choose Install core first.'; return 1; }; }
 lock_action() {
     # Called as a direct command, not in an if/|| context: errexit applies inside.
     (
@@ -83,6 +93,7 @@ save_menu() (
     mv -fT -- "$staged" "$PHX_SAVE"
 )
 install_core() {
+    heading 'Install / update Phoenix core'
     need curl sha256sum install mktemp timeout
     layout
     local arch asset digest tmp reported destination
@@ -172,6 +183,7 @@ commit_tunnel() {
     printf 'Created: %s\n' "$unit"
 }
 create_iran() {
+    heading 'Create Iran tunnel'
     need jq openssl base32 tr systemctl timeout install chmod mktemp
     require_core
     layout
@@ -239,6 +251,7 @@ decode_code() {
     ' "$output" >/dev/null || { fail 'Invalid connection settings.'; return 1; }
 }
 create_kharej() {
+    heading 'Create Kharej tunnel'
     need jq openssl base32 systemctl install chmod mktemp
     require_core; layout; safe_dir "$PHX_UNITS"
     local name code tmp
@@ -270,6 +283,7 @@ owned() {
     [[ $(systemctl show "$unit" -p FragmentPath --value) == "$PHX_UNITS/$unit" ]] || return 1
 }
 select_tunnel() {
+    heading 'Select Phoenix tunnel'
     need systemctl || return
     local path name n=0 choice
     local -a names=()
@@ -288,6 +302,7 @@ select_tunnel() {
 manage_action() {
     local action=$1 selected unit mode suffix
     select_tunnel || return 0
+    heading "Phoenix tunnel: $action"
     unit=$(unit_name "$selected")
     case $action in
         restart|stop|start)
@@ -322,6 +337,7 @@ manage_action() {
     esac
 }
 remove_core() {
+    heading 'Remove Phoenix core'
     layout
     local file
     for file in "$PHX_UNITS"/phoenix-standalone-*.service; do
@@ -335,12 +351,17 @@ remove_core() {
 manage_menu() {
     local choice role
     while :; do
+        if ! require_core; then
+            pause
+            return 0
+        fi
         heading 'Phoenix Tunnel Management'
         printf '%s\n' '1) Create tunnel' '2) Restart tunnel' '3) Stop tunnel' '4) Remove tunnel'             '5) View logs' '6) View live logs' '7) View tunnel details' '8) Health check'             '9) Status' '10) Kharej connection code' '11) Start stopped tunnel' '0) Back'
         ask 'Choice: ' choice || return
         case $choice in
             0) return ;;
             1)
+                heading 'Create Phoenix tunnel'
                 printf '\n1) Iran (server)\n2) Kharej (client)\n0) Back\n'
                 ask 'Role: ' role || return
                 case $role in
@@ -367,7 +388,7 @@ menu() {
     local choice
     while :; do
         heading 'Phoenix Tunnel'
-        if [[ -x $(core) ]]; then printf 'Core: Installed\n'; else printf 'Core: Not installed\n'; fi
+        if core_ready; then printf 'Core: Installed\n'; else printf 'Core: Not installed\n'; fi
         printf '\n1) Install / update core\n2) Manage tunnels\n3) Remove core\n0) Exit\n'
         ask 'Choice: ' choice || return 0
         case $choice in
