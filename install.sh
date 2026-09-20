@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-6
+PHX_REV=standalone-7
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
@@ -384,7 +384,12 @@ select_tunnel() {
         names+=("$name"); n=$((n+1))
         printf '%s) %s [%s]\n' "$n" "$name" "$(systemctl is-active "$(unit_name "$name")" 2>/dev/null || :)"
     done
-    ((n>0)) || { fail 'No standalone Phoenix tunnels found.'; return 1; }
+    if ((n == 0)); then
+        notice 33 'No tunnels yet.'
+        notice 37 'Choose Create tunnel to get started.'
+        return 1
+    fi
+    option 0 'Back'
     ask 'Tunnel number (0 = back): ' choice || return
     [[ $choice =~ ^[0-9]{1,3}$ ]] && ((10#$choice>0 && 10#$choice<=n)) || return 1
     selected=${names[10#$choice-1]}
@@ -489,13 +494,13 @@ manage_menu() {
                 heading 'Create Phoenix tunnel'
                 option 1 'Iran (server)'
                 option 2 'Kharej (client)'
-                option 3 'Back'
+                option 0 'Back'
                 printf '\n'
                 ask '  Select a role: ' role || return
                 case $role in
                     1) lock_action create_iran ;;
                     2) lock_action create_kharej ;;
-                    0|3) continue ;;
+                    0) continue ;;
                     *) notice 33 'Invalid option.'; pause; continue ;;
                 esac ;;
             2) lock_action manage_action restart ;;
