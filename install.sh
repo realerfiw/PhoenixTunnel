@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-19
+PHX_REV=standalone-20
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -266,17 +266,41 @@ version_key() {
     if [[ $version == *-dev.* ]]; then stable=0; dev=${version##*.}; fi
     printf '%s.%s.%s\n' "$main" "$stable" "$dev"
 }
+refresh_release_status() {
+    local latest=''
+    # Private temporary state belongs to this menu process, never /opt configs.
+    [[ -n ${PHX_RELEASE_CACHE:-} ]] || return 0
+    if [[ -f $PHX_RELEASE_CACHE/result ]]; then
+        IFS= read -r latest < "$PHX_RELEASE_CACHE/result" || :
+        PHX_LATEST_CORE=''
+        if release_version_valid "$latest"; then PHX_LATEST_CORE=$latest; fi
+        rm -f -- "$PHX_RELEASE_CACHE/result"
+        if [[ -n ${PHX_RELEASE_PID:-} ]]; then wait "$PHX_RELEASE_PID" 2>/dev/null || :; fi
+        PHX_RELEASE_PID=''
+    fi
+    if [[ -n ${PHX_RELEASE_PID:-} ]] && ! kill -0 "$PHX_RELEASE_PID" 2>/dev/null; then
+        wait "$PHX_RELEASE_PID" 2>/dev/null || :
+        PHX_RELEASE_PID=''
+    fi
+    if [[ -z ${PHX_RELEASE_PID:-} ]] && { [[ ! -v PHX_RELEASE_CHECKED ]] || ((SECONDS - PHX_RELEASE_CHECKED >= 300)); }; then
+        PHX_RELEASE_CHECKED=$SECONDS
+        PHX_LATEST_CORE=''
+        (
+            trap - EXIT INT TERM
+            latest=$(latest_core_release) || latest=''
+            printf '%s\n' "$latest" > "$PHX_RELEASE_CACHE/pending"
+            mv -f -- "$PHX_RELEASE_CACHE/pending" "$PHX_RELEASE_CACHE/result"
+        ) </dev/null >/dev/null 2>&1 &
+        PHX_RELEASE_PID=$!
+    fi
+}
 core_status() {
     if ! core_present; then notice 33 'Core: Not installed'; return; fi
     if ! core_ready; then notice 31 'Core: Invalid · Run Install / update core'; return; fi
     local installed latest label=Unknown color=33 newest
     installed=${PHX_CORE_INSTALLED:-}
-    if [[ ! -v PHX_RELEASE_CHECKED ]] || ((SECONDS - PHX_RELEASE_CHECKED >= 300)); then
-        PHX_RELEASE_CHECKED=$SECONDS
-        PHX_LATEST_CORE=''
-        latest=$(latest_core_release) || latest=''
-        release_version_valid "$latest" && PHX_LATEST_CORE=$latest
-    fi
+    refresh_release_status
+    [[ -z ${PHX_RELEASE_PID:-} ]] || label=Checking
     latest=${PHX_LATEST_CORE:-}
     if [[ -n $latest ]]; then
         if [[ $installed == "$latest" ]]; then label=Latest; color=32
@@ -485,6 +509,28 @@ ask_mapping_port() {
         else fail 'Unable to check public ports. No tunnel created.'; return 1; fi
     done
 }
+runtime_diagnostics() {
+    local unit=$1 pid=$2 config=$3 disk running restarts cert
+    if read_core_version; then notice 37 "Installed core: $PHX_CORE_INSTALLED"; fi
+    if [[ $pid =~ ^[1-9][0-9]*$ ]]; then
+        disk=$(stat -Lc '%d:%i' -- "$(core)" 2>/dev/null) || disk=''
+        running=$(stat -Lc '%d:%i' -- "/proc/$pid/exe" 2>/dev/null) || running=''
+        if [[ -n $disk && -n $running ]]; then
+            if [[ $disk == "$running" ]]; then notice 32 '[PASS] Running executable matches installed core'
+            else notice 33 '[WARN] Running executable differs · Restart required'; fi
+        else notice 33 '[UNKNOWN] Running executable could not be inspected'; fi
+    fi
+    restarts=$(timeout 3 systemctl show "$unit" -p NRestarts --value 2>/dev/null) || restarts=''
+    if [[ $restarts =~ ^[0-9]+$ ]]; then notice 37 "Automatic restarts (systemd counter): $restarts"; fi
+    cert=$(jq -r '.server.certificate_file // .client.ca_file // empty' "$config") || cert=''
+    if [[ -n $cert ]] && command -v openssl >/dev/null; then
+        if timeout 3 openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1; then
+            if timeout 3 openssl x509 -in "$cert" -noout -checkend 2592000 >/dev/null 2>&1; then
+                notice 32 '[PASS] Certificate expires in more than 30 days (local check only)'
+            else notice 33 '[WARN] Certificate expires within 30 days'; fi
+        else notice 33 '[WARN] Certificate expired or could not be read'; fi
+    fi
+}
 health_check() {
     local name=$1 unit config mode state pid sockets address protocol port owner failures=0
     unit=$(unit_name "$name"); config="$PHX_BASE/configs/$name.json"
@@ -496,6 +542,7 @@ health_check() {
     pid=$(systemctl show "$unit" -p MainPID --value) || pid=0
     if [[ $state == active && $pid =~ ^[1-9][0-9]*$ ]]; then notice 32 "[PASS] Service running · PID $pid"
     else notice 31 "[FAIL] Service: $state"; failures=1; fi
+    runtime_diagnostics "$unit" "$pid" "$config"
     mode=$(jq -r .mode "$config") || return 1
     if [[ $mode == server ]]; then
         while IFS=$'\t' read -r protocol address; do
@@ -609,7 +656,7 @@ format_logs() {
         then .value="[hidden]" else . end) else . end);
       def fields($prefix):
         if type=="object" and length>0 then to_entries[] |
-          .key as $key | .value | fields(if $prefix=="" then $key else $prefix+"."+$key end)
+          (.key|safe) as $key | .value | fields(if $prefix=="" then $key else $prefix+"."+$key end)
         elif type=="array" and length>0 then to_entries[] |
           .key as $key | .value | fields($prefix+"["+($key|tostring)+"]")
         else ({mode:"Mode",carrier:"Transport",carrier_listen:"Listen",operations_listen:"Operations",
@@ -636,7 +683,7 @@ format_logs() {
            $body|to_entries[]|select(.key!="msg" and .key!="level")|
            select(.key!="time" or (.value|type)!="string" or
              (.value|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$")|not)) |
-           .key as $key | .value | fields($key)
+           (.key|safe) as $key | .value | fields($key)
          else empty end,
          if $j|has("MESSAGE") then empty else $j|redact|fields("journal") end,
          ($j.SYSLOG_IDENTIFIER // $j._COMM // "phoenix") as $source |
@@ -654,11 +701,16 @@ format_logs() {
 }
 show_logs() {
     local unit=$1 live=${2:-false}
-    local -a options=(--no-pager --all --no-tail --output=json --unit="$unit")
+    local -a options=(--no-pager --all --output=json --unit="$unit")
     need journalctl jq || return 1
     if journalctl --help | grep -q -- --namespace; then options+=(--namespace=+phoenix-standalone); fi
-    [[ $live != true ]] || options+=(--follow)
-    notice 37 'All retained entries · UTC'
+    if [[ $live == true ]]; then
+        options+=(--lines=50 --follow)
+        notice 37 'Last 50 entries + live · UTC · Full history: View logs'
+    else
+        options+=(--no-tail)
+        notice 37 'All retained entries · UTC'
+    fi
     [[ $live != true ]] || notice 37 'Press Ctrl+C to return'
     local result=0
     journalctl "${options[@]}" | format_logs || result=$?
@@ -1067,8 +1119,20 @@ manage_menu() {
         ((action_status == 2)) || pause
     done
 }
-menu() {
+menu() (
     local choice
+    PHX_RELEASE_CACHE=$(mktemp -d /tmp/phoenix-release.XXXXXXXX) || PHX_RELEASE_CACHE=''
+    cleanup_release_check() {
+        if [[ -n ${PHX_RELEASE_PID:-} ]]; then
+            # The network request is bounded to two seconds; reap it before cleanup.
+            wait "$PHX_RELEASE_PID" 2>/dev/null || :
+        fi
+        if [[ -n $PHX_RELEASE_CACHE ]]; then
+            rm -f -- "$PHX_RELEASE_CACHE/pending" "$PHX_RELEASE_CACHE/result"
+            rmdir -- "$PHX_RELEASE_CACHE" 2>/dev/null || :
+        fi
+    }
+    trap cleanup_release_check EXIT
     while :; do
         heading 'Phoenix Tunnel Menu'
         core_status
@@ -1087,7 +1151,7 @@ menu() {
             *) invalid_choice ;;
         esac
     done
-}
+)
 main() {
     [[ $# == 0 ]] || { fail 'Run without arguments to open the menu.'; return 1; }
     [[ $(uname -s) == Linux && $EUID == 0 ]] || { fail 'Run with Bash as root on Linux.'; return 1; }
