@@ -6,6 +6,7 @@ REPOSITORY="PhoenixTunnel"
 VERSION="${PHOENIX_VERSION:-v0.1.0-dev.69}"
 INSTALL_DIR="${PHOENIX_INSTALL_DIR:-/opt/phoenix-tunnel}"
 BASE_URL="https://github.com/${OWNER}/${REPOSITORY}/releases/download/${VERSION}"
+INSTALLER_URL="https://raw.githubusercontent.com/${OWNER}/${REPOSITORY}/main/install.sh"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Phoenix installer must run as root." >&2
@@ -50,6 +51,8 @@ curl --fail --location --silent --show-error \
     "${BASE_URL}/${ASSET}" --output "${TEMP_DIR}/${ASSET}"
 curl --fail --location --silent --show-error \
     "${BASE_URL}/SHA256SUMS" --output "${TEMP_DIR}/SHA256SUMS"
+curl --fail --location --silent --show-error \
+    "$INSTALLER_URL" --output "${TEMP_DIR}/install.sh"
 
 EXPECTED_SHA="$(awk -v asset="$ASSET" '$2 == asset { print $1; exit }' "${TEMP_DIR}/SHA256SUMS")"
 if [ -z "$EXPECTED_SHA" ]; then
@@ -66,7 +69,9 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 install -m 0755 "${TEMP_DIR}/${ASSET}" "${INSTALL_DIR}/phoenix"
+install -m 0755 "${TEMP_DIR}/install.sh" "${INSTALL_DIR}/install.sh"
 
 echo "Installed: ${INSTALL_DIR}/phoenix"
+echo "Installer saved: ${INSTALL_DIR}/install.sh"
 "${INSTALL_DIR}/phoenix" version
 echo "Existing Phoenix services are not started or restarted by this installer."
