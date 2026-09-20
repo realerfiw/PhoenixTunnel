@@ -4,7 +4,7 @@ set -eu
 OWNER="realerfiw"
 REPOSITORY="PhoenixTunnel"
 VERSION="${PHOENIX_VERSION:-v0.1.0-dev.69}"
-CORE_DIR="${PHOENIX_CORE_DIR:-/opt/tunnel-manager/cores}"
+INSTALL_DIR="${PHOENIX_INSTALL_DIR:-/opt/phoenix-tunnel}"
 BASE_URL="https://github.com/${OWNER}/${REPOSITORY}/releases/download/${VERSION}"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -64,9 +64,9 @@ else
     printf '%s  %s\n' "$EXPECTED_SHA" "${TEMP_DIR}/${ASSET}" | shasum -a 256 -c -
 fi
 
-mkdir -p "$CORE_DIR"
-install -m 0755 "${TEMP_DIR}/${ASSET}" "${CORE_DIR}/phoenix"
+mkdir -p "$INSTALL_DIR"
+install -m 0755 "${TEMP_DIR}/${ASSET}" "${INSTALL_DIR}/phoenix"
 
-echo "Installed: ${CORE_DIR}/phoenix"
-"${CORE_DIR}/phoenix" version
+echo "Installed: ${INSTALL_DIR}/phoenix"
+"${INSTALL_DIR}/phoenix" version
 echo "Existing Phoenix services are not started or restarted by this installer."
