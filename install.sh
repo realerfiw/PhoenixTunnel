@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-21
+PHX_REV=standalone-22
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -1097,6 +1097,8 @@ manage_menu() {
             *) invalid_choice; continue ;;
         esac
         action_status=$?
+        # Ctrl+C ends live following, not the management session.
+        if [[ $choice == 6 && $action_status == 130 ]]; then continue; fi
         ((action_status == 2)) || pause
     done
 }
