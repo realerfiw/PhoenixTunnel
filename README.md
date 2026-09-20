@@ -26,15 +26,6 @@ Download the latest build from [Releases](https://github.com/realerfiw/PhoenixTu
 
 Download `SHA256SUMS` and the matching license files with the core.
 
-Verify and run:
-
-```sh
-chmod 755 phoenix-linux-amd64
-./phoenix-linux-amd64 version
-```
-
-For ARM64, use `phoenix-linux-arm64` instead.
-
 ## Install the core
 
 On a supported Linux host, run:
