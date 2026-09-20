@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-8
+PHX_REV=standalone-9
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
@@ -112,7 +112,6 @@ heading() {
     notice '1;36' "$1"
     notice 36 '--------------------------------------------'
 }
-valid_name() { [[ $1 =~ ^[a-z][a-z0-9-]{0,31}$ ]]; }
 valid_host() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$ || $1 =~ ^\[[0-9a-fA-F:]+\]$ ]]; }
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 <= 65535 )); }
 unit_name() { printf 'phoenix-standalone-%s.service' "$1"; }
@@ -216,23 +215,52 @@ install_core() {
         fi
     done
 }
-new_name() {
-    local label=$1
-    ask 'Tunnel name (letters, numbers, hyphens): ' name || return 1
-    valid_name "$name" || { fail 'Use 1-32 lowercase characters, starting with a letter.'; return 1; }
-    name="$label-$name"
-    name_available "$name"
+automatic_name() {
+    local role=$1 carrier=$2 port=$3 suffix candidate state
+    [[ $role == iran || $role == kharej ]] || return 1
+    [[ $carrier == auto || $carrier == h2 || $carrier == h3 ]] || return 1
+    valid_port "$port" || return 1
+    port=$((10#$port))
+    for ((suffix=1; suffix<=9999; suffix++)); do
+        candidate="$role-$carrier-$port"
+        ((suffix == 1)) || candidate+="-$suffix"
+        if name_available "$candidate"; then name=$candidate; return 0; else state=$?; fi
+        ((state == 1)) || return "$state"
+    done
+    fail 'No free tunnel name available.'
 }
 name_available() {
-    local name=$1
+    local name=$1 load_state
     local f
     for f in "$PHX_BASE/configs/$name".*; do
-        [[ ! -e $f && ! -L $f ]] || { fail 'That tunnel name already exists.'; return 1; }
+        [[ ! -e $f && ! -L $f ]] || return 1
     done
     [[ ! -e "$PHX_UNITS/$(unit_name "$name")" && ! -L "$PHX_UNITS/$(unit_name "$name")" ]] ||
-        { fail 'Service already exists.'; return 1; }
-    [[ $(systemctl show "$(unit_name "$name")" -p LoadState --value) == not-found ]] ||
-        { fail 'A service with this name already exists.'; return 1; }
+        return 1
+    load_state=$(systemctl show "$(unit_name "$name")" -p LoadState --value) || {
+        fail 'Unable to check existing services.'; return 2;
+    }
+    case $load_state in
+        not-found) return 0 ;;
+        loaded|error|masked|merged|stub|bad-setting) return 1 ;;
+        *) fail 'Unable to check existing services.'; return 2 ;;
+    esac
+}
+connection_available() {
+    local role=$1 address=$2 agent=${3:-} config result
+    for config in "$PHX_BASE/configs/$role-"*.json; do
+        [[ -e $config || -L $config ]] || continue
+        [[ -f $config && ! -L $config ]] || { fail 'Unsafe existing configuration.'; return 1; }
+        if jq -se --arg role "$role" --arg address "$address" --arg agent "$agent" '
+            if length!=1 or (.[0]|type)!="object" then error("invalid configuration") else .[0] end |
+            if $role=="iran" then .mode=="server" and (.server.carrier_listen|split(":")|last)==$address
+            else .mode=="client" and .client.server_address==$address and .auth.agent_id==$agent end
+        ' "$config" >/dev/null; then
+            fail 'This tunnel connection is already configured.'; return 1
+        else result=$?; fi
+        ((result == 1)) || { fail 'Unable to check existing configuration.'; return 1; }
+    done
+    return 0
 }
 write_config() {
     local mode=$1 payload=$2 prefix=$3 output=$4
@@ -283,7 +311,6 @@ create_iran() {
     layout
     safe_dir "$PHX_UNITS"
     local name host port carrier protocol listen target_host target_port more tmp agent token mappings='[]' count=0
-    new_name iran || return
     ask 'Iran public IP / hostname: ' host || return
     valid_host "$host" || { fail 'Invalid IP / hostname.'; return 1; }
     ask 'Tunnel port [7845]: ' port 7845 || return
@@ -291,6 +318,8 @@ create_iran() {
     port=$((10#$port))
     ask 'Carrier (auto/h2/h3) [auto]: ' carrier auto || return
     [[ $carrier == auto || $carrier == h2 || $carrier == h3 ]] || return 1
+    connection_available iran "$port" || return 1
+    automatic_name iran "$carrier" "$port" || return 1
     while :; do
         ask 'Forward protocol (tcp/udp) [tcp]: ' protocol tcp || return
         [[ $protocol == tcp || $protocol == udp ]] || return 1
@@ -348,16 +377,18 @@ create_kharej() {
     heading 'Create Kharej tunnel'
     need jq openssl base32 systemctl install chmod mktemp
     require_core; layout; safe_dir "$PHX_UNITS"
-    local name code tmp
+    local name code tmp carrier port address agent
     ask 'Paste Iran connection code: ' code || return
     tmp=$(mktemp -d "$PHX_BASE/configs/.setup.XXXXXXXX"); chmod 0700 "$tmp"
     PHX_TEMP=$tmp; trap 'rm -rf -- "$PHX_TEMP"' EXIT
     umask 077
     decode_code "$code" "$tmp/payload" || return 1
-    # Stable identity from validated settings: same code cannot overwrite a tunnel.
-    # Include an agent fragment so independent Iran tunnels can share a port.
-    name=$(jq -r '"kharej-"+.carrier+"-"+(.port|tostring)+"-"+.agent[0:12]' "$tmp/payload")
-    name_available "$name" || return 1
+    carrier=$(jq -r .carrier "$tmp/payload")
+    port=$(jq -r .port "$tmp/payload")
+    address=$(jq -r '.host+":"+(.port|tostring)' "$tmp/payload")
+    agent=$(jq -r .agent "$tmp/payload")
+    connection_available kharej "$address" "$agent" || return 1
+    automatic_name kharej "$carrier" "$port" || return 1
     jq -r .ca "$tmp/payload" > "$tmp/tls.crt"
     openssl x509 -in "$tmp/tls.crt" -noout >/dev/null
     jq -r '"PHOENIX_TOKEN="+.token' "$tmp/payload" > "$tmp/config.env"

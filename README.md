@@ -45,7 +45,9 @@ with `bash /root/install.sh`.
 4. On Kharej, choose **Create tunnel > Kharej** and paste the code.
 
 Creating a tunnel starts its service and enables it after reboot. Each tunnel
-has its own name and configuration. Manage tunnels provides restart, stop,
+is named automatically by role, carrier and tunnel port (for example,
+`iran-auto-9090`), with a numeric suffix when needed. Each has its own
+configuration. Manage tunnels provides restart, stop,
 remove, logs, details, validation and status actions.
 
 Files are kept in:
