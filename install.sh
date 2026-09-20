@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-17
+PHX_REV=standalone-18
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -181,7 +181,24 @@ safe_dir() {
 }
 layout() { safe_dir "$PHX_BASE" && safe_dir "$PHX_BASE/core" && safe_dir "$PHX_BASE/configs"; }
 core() { printf '%s/core/phoenix' "$PHX_BASE"; }
-core_ready() { [[ -f $(core) && ! -L $(core) && -x $(core) ]]; }
+core_present() { [[ -f $(core) && ! -L $(core) && -x $(core) ]]; }
+read_core_version() {
+    local signature output candidate
+    PHX_CORE_INSTALLED=${PHX_CORE_INSTALLED:-}
+    core_present || { PHX_CORE_INSTALLED=''; PHX_CORE_SIGNATURE=''; return 1; }
+    signature=$(stat -c '%d:%i:%s:%y:%z' -- "$(core)" 2>/dev/null) || signature=''
+    if [[ -z $signature || $signature != "${PHX_CORE_SIGNATURE:-}" ]]; then
+        PHX_CORE_SIGNATURE=$signature; PHX_CORE_INSTALLED=''
+        output=$(timeout 2 "$(core)" version 2>/dev/null) || return 1
+        if [[ $output =~ ^phoenix[[:space:]]+v?([^[:space:]]+) ]]; then
+            candidate=${BASH_REMATCH[1]}
+            release_version_valid "$candidate" || return 1
+            PHX_CORE_INSTALLED=$candidate
+        fi
+    fi
+    [[ -n $PHX_CORE_INSTALLED ]]
+}
+core_ready() { read_core_version; }
 release_version_valid() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+(-dev\.[0-9]+)?$ ]]; }
 latest_core_release() {
     # /latest excludes development releases. Never download a core from this response.
@@ -195,20 +212,10 @@ version_key() {
     printf '%s.%s.%s\n' "$main" "$stable" "$dev"
 }
 core_status() {
-    if ! core_ready; then notice 33 'Core: Not installed'; return; fi
-    local signature output installed latest label=Unknown color=33 newest
-    signature=$(stat -c '%d:%i:%s:%y:%z' -- "$(core)" 2>/dev/null) || signature=''
-    if [[ -z $signature || $signature != "${PHX_CORE_SIGNATURE:-}" ]]; then
-        PHX_CORE_SIGNATURE=$signature
-        PHX_CORE_INSTALLED=''
-        output=$(timeout 2 "$(core)" version 2>/dev/null) || output=''
-        if [[ $output =~ ^phoenix[[:space:]]+v?([^[:space:]]+) ]]; then
-            installed=${BASH_REMATCH[1]}
-            release_version_valid "$installed" && PHX_CORE_INSTALLED=$installed
-        fi
-    fi
+    if ! core_present; then notice 33 'Core: Not installed'; return; fi
+    if ! core_ready; then notice 31 'Core: Invalid · Run Install / update core'; return; fi
+    local installed latest label=Unknown color=33 newest
     installed=${PHX_CORE_INSTALLED:-}
-    if [[ -z $installed ]]; then notice 33 'Core: Installed · Version unknown'; return; fi
     if [[ ! -v PHX_RELEASE_CHECKED ]] || ((SECONDS - PHX_RELEASE_CHECKED >= 300)); then
         PHX_RELEASE_CHECKED=$SECONDS
         PHX_LATEST_CORE=''
@@ -229,7 +236,7 @@ core_status() {
     fi
     notice "$color" "Core: Installed · $installed · $label"
 }
-require_core() { core_ready || { fail 'Choose Install core first.'; return 1; }; }
+require_core() { core_ready || { fail 'Choose Install core first. Core is missing or invalid.'; return 1; }; }
 lock_action() {
     # Called as a direct command, not in an if/|| context: errexit applies inside.
     (
@@ -279,6 +286,14 @@ install_core() {
         *) fail 'Supported architectures: amd64, arm64'; return 1 ;;
     esac
     install_dependencies || return 1
+    if read_core_version; then
+        local newest
+        newest=$(printf '%s\n%s\n' "$(version_key "$PHX_CORE_INSTALLED")" "$(version_key "${PHX_VERSION#v}")" | sort -V | tail -n 1)
+        if [[ $PHX_CORE_INSTALLED != "${PHX_VERSION#v}" && $newest == "$(version_key "$PHX_CORE_INSTALLED")" ]]; then
+            fail "Installed $PHX_CORE_INSTALLED is newer than ${PHX_VERSION#v}. Update the menu first; core unchanged."
+            return 1
+        fi
+    fi
     need curl sha256sum install mktemp timeout
     layout
     # Selecting Install / update core is the user's confirmation.
@@ -383,6 +398,36 @@ ask_tunnel_port() {
         if port_available "$port"; then return 0; else result=$?; fi
         if ((result == 1)); then notice 33 "Port $port is already in use or reserved. Enter another port."
         else fail 'Unable to check ports. No tunnel created.'; return 1; fi
+    done
+}
+mapping_port_available() {
+    local protocol=$1 port=$2 pending=${3:-[]} config conflict sockets flag=-lnt
+    [[ $protocol == tcp ]] || flag=-lnu
+    conflict=$(jq -er --arg p "$protocol" --arg port "$port" \
+        '[.[] | select(.protocol==$p and (.listen|split(":")|last)==$port)] | length | tostring' <<< "$pending") || return 2
+    [[ $conflict == 0 ]] || return 1
+    for config in "$PHX_BASE/configs/iran-"*.json; do
+        [[ -e $config || -L $config ]] || continue
+        [[ -f $config && ! -L $config ]] || return 2
+        conflict=$(jq -ser --arg p "$protocol" --arg port "$port" '
+          if length!=1 or (.[0]|type)!="object" then error("invalid config") else .[0] end |
+          ((.server.carrier_listen|split(":")|last)==$port or
+            any(.mappings[]; .protocol==$p and (.listen|split(":")|last)==$port)) | tostring' "$config") || return 2
+        [[ $conflict != true ]] || return 1
+    done
+    sockets=$(ss -H "$flag" "sport = :$port" 2>/dev/null) || return 2
+    [[ -z $sockets ]]
+}
+ask_mapping_port() {
+    local result
+    while :; do
+        ask 'Iran public port: ' listen || return 1
+        if ! valid_port "$listen"; then notice 33 'Invalid port. Enter a port from 1 to 65535.'; continue; fi
+        listen=$((10#$listen))
+        if [[ $listen == "$port" ]]; then notice 33 'Public port must differ from tunnel port.'; continue; fi
+        if mapping_port_available "$protocol" "$listen" "$mappings"; then return 0; else result=$?; fi
+        if ((result == 1)); then notice 33 "Port $listen ($protocol) is in use or reserved. Enter another port."
+        else fail 'Unable to check public ports. No tunnel created.'; return 1; fi
     done
 }
 health_check() {
@@ -570,34 +615,70 @@ write_unit() {
     printf '\n[Service]\n' >> "$output"
     log_settings >> "$output"
 }
-commit_tunnel() {
+commit_tunnel() (
+    set -e
     local mode=$1 name=$2 tmp=$3 suffix unit
+    local committed=false unit_written=false path
+    local -a created=()
     unit=$(unit_name "$name")
+    # Refuse every pre-existing destination before installing any new file.
+    name_available "$name" || return 1
+    rollback_creation() {
+        local result=$?
+        trap - EXIT INT TERM
+        if [[ $committed != true && ${#created[@]} -gt 0 ]]; then
+            if [[ $unit_written == true ]]; then
+                if ! systemctl stop "$unit" || ! systemctl disable "$unit"; then
+                    fail "Incomplete creation: $unit retained because cleanup could not stop/disable it. Check Status."
+                    exit 1
+                fi
+            fi
+            for path in "${created[@]}"; do rm -f -- "$path" || result=1; done
+            if [[ $unit_written == true ]]; then systemctl daemon-reload || result=1; fi
+            notice 33 'Creation failed; new tunnel files removed. Existing tunnels unchanged.'
+        fi
+        exit "$result"
+    }
+    trap rollback_creation EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     # All paths are generated locally. Incoming codes cannot set file paths or units.
     if [[ $mode == server ]]; then
         local requested_port
         requested_port=$(jq -r .port "$tmp/payload") || return 1
         port_available "$requested_port" || { fail "Port $requested_port is no longer available. Choose another port."; return 1; }
+        local mapping_protocol mapping_address
+        while IFS=$'\t' read -r mapping_protocol mapping_address; do
+            mapping_port_available "$mapping_protocol" "${mapping_address##*:}" || { fail "Public port ${mapping_address##*:} is unavailable."; return 1; }
+        done < <(jq -r '.mappings[]|[.protocol,.listen]|@tsv' "$tmp/payload")
     fi
     write_config "$mode" "$tmp/payload" "$tmp/tls" "$tmp/validate.json"
     "$(core)" validate --mode "$mode" --config "$tmp/validate.json" --environment "$tmp/config.env"
     prepare_log_policy || return 1
     write_config "$mode" "$tmp/payload" "$PHX_BASE/configs/$name" "$tmp/config.json"
     write_unit "$name" "$mode" "$tmp/service"
-    for suffix in json env; do install -m 0600 "$tmp/config.$suffix" "$PHX_BASE/configs/$name.$suffix"; done
+    for suffix in json env; do
+        created+=("$PHX_BASE/configs/$name.$suffix")
+        install -m 0600 "$tmp/config.$suffix" "$PHX_BASE/configs/$name.$suffix"
+    done
+    created+=("$PHX_BASE/configs/$name.crt")
     install -m 0600 "$tmp/tls.crt" "$PHX_BASE/configs/$name.crt"
     if [[ $mode == server ]]; then
+        created+=("$PHX_BASE/configs/$name.key" "$PHX_BASE/configs/$name.code")
         install -m 0600 "$tmp/tls.key" "$PHX_BASE/configs/$name.key"
         install -m 0600 "$tmp/code" "$PHX_BASE/configs/$name.code"
     fi
+    created+=("$PHX_UNITS/$unit")
     install -m 0644 "$tmp/service" "$PHX_UNITS/$unit"
+    unit_written=true
     systemctl daemon-reload
     systemctl enable --now "$unit"
     if ! systemctl is-active --quiet "$unit"; then
-        fail "Created $unit, but startup failed. Check View logs."; return 1
+        fail "Startup failed: $unit. Check journalctl -u $unit."; return 1
     fi
+    committed=true
     printf 'Created: %s\n' "$unit"
-}
+)
 create_iran() {
     heading 'Create Iran tunnel'
     need jq openssl base32 tr systemctl timeout install chmod mktemp
@@ -615,7 +696,7 @@ create_iran() {
         ask 'Protocol (tcp/udp) [tcp]: ' protocol tcp || return
         [[ $protocol == tcp || $protocol == udp ]] || return 1
         [[ $carrier != h3 || $protocol == udp ]] || { fail 'Use auto/h2 for TCP in this setup.'; return 1; }
-        ask 'Iran public port: ' listen || return
+        ask_mapping_port || return 1
         ask 'Kharej target IP [127.0.0.1]: ' target_host 127.0.0.1 || return
         ask 'Kharej target port: ' target_port || return
         valid_port "$listen" && valid_port "$target_port" && valid_host "$target_host" || { fail 'Invalid mapping.'; return 1; }
