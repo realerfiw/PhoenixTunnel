@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-4
+PHX_REV=standalone-5
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
@@ -23,6 +23,50 @@ notice() { paint "$1" "  $2"; printf '\n'; }
 option() { paint '36' "$(printf '  %2s' "$1")"; printf '  %s\n' "$2"; }
 fail() { printf 'Phoenix: %s\n' "$*" >&2; return 1; }
 need() { local c; for c; do command -v "$c" >/dev/null || { fail "Required command: $c"; return 1; }; done; }
+ca_ready() { [[ -s /etc/ssl/certs/ca-certificates.crt ]]; }
+missing_dependency_packages() {
+    local entry cmd package
+    local -A missing=()
+    for entry in curl:curl jq:jq openssl:openssl flock:util-linux \
+        systemctl:systemd journalctl:systemd grep:grep \
+        update-ca-certificates:ca-certificates \
+        base32:coreutils tr:coreutils sha256sum:coreutils timeout:coreutils \
+        realpath:coreutils stat:coreutils install:coreutils mktemp:coreutils \
+        chmod:coreutils cp:coreutils mv:coreutils rm:coreutils rmdir:coreutils \
+        cat:coreutils dirname:coreutils uname:coreutils; do
+        cmd=${entry%%:*}; package=${entry#*:}
+        command -v "$cmd" >/dev/null 2>&1 || missing[$package]=1
+    done
+    ca_ready || missing[ca-certificates]=1
+    for package in curl jq openssl util-linux systemd grep ca-certificates coreutils; do
+        [[ ! -v missing[$package] ]] || printf '%s\n' "$package"
+    done
+}
+install_dependencies() {
+    local -a packages=()
+    mapfile -t packages < <(missing_dependency_packages)
+    ((${#packages[@]})) || return 0
+    command -v apt-get >/dev/null 2>&1 || {
+        fail "Install required packages first: ${packages[*]} (automatic setup requires Ubuntu/Debian APT)."
+        return 1
+    }
+    notice 36 "Installing required packages: ${packages[*]}"
+    # Never upgrade the OS, remove packages, bypass signatures or force APT locks.
+    # List-only needrestart mode avoids restarting unrelated services.
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+        apt-get -o APT::Update::Error-Mode=any update || {
+        fail 'Package index update failed. Core unchanged; retry Install / update core.'; return 1
+    }
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+        apt-get -o DPkg::Lock::Timeout=60 install -y --no-install-recommends --no-remove "${packages[@]}" || {
+        fail 'Dependency installation failed. Core unchanged; retry Install / update core.'; return 1
+    }
+    hash -r
+    mapfile -t packages < <(missing_dependency_packages)
+    ((${#packages[@]} == 0)) || {
+        fail "Dependencies still unavailable: ${packages[*]}. Core unchanged."; return 1
+    }
+}
 ask() {
     local prompt=$1 default=${3:-}
     printf '%s' "$prompt"
@@ -81,6 +125,10 @@ lock_action() {
     # Called as a direct command, not in an if/|| context: errexit applies inside.
     (
         set -e
+        # util-linux may be missing on a minimal host; bootstrap only on Install.
+        if [[ ${1:-} == install_core ]] && ! command -v flock >/dev/null 2>&1; then
+            install_dependencies
+        fi
         need flock
         [[ ! -L $PHX_LOCK ]]
         exec 9>"$PHX_LOCK"
@@ -115,14 +163,15 @@ save_menu() (
 )
 install_core() {
     heading 'Install / update Phoenix core'
-    need curl sha256sum install mktemp timeout
-    layout
     local arch asset digest tmp reported destination
     case $(uname -m) in
         x86_64|amd64) arch=amd64; digest=e1504be2242ca00992541dd31367b5335238d27db938d232b0fc9cc33cce4764 ;;
         aarch64|arm64) arch=arm64; digest=45a9265a1ab740a7d0f4f9278afee875bd6a7ca30606b23ec7be5141e3e3c871 ;;
         *) fail 'Supported architectures: amd64, arm64'; return 1 ;;
     esac
+    install_dependencies || return 1
+    need curl sha256sum install mktemp timeout
+    layout
     # Selecting Install / update core is the user's confirmation.
     for destination in "$(core)" "$PHX_BASE/core/LICENSE" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"; do
         [[ ! -L $destination && ( ! -e $destination || -f $destination ) ]] ||
@@ -367,15 +416,25 @@ manage_action() {
 }
 remove_core() {
     heading 'Remove Phoenix core'
-    layout
     local file
+    # Validate existing directories without creating anything during removal.
+    for file in "$PHX_BASE" "$PHX_BASE/core" "$PHX_BASE/configs"; do
+        if [[ -e $file || -L $file ]]; then safe_dir "$file" || return 1; fi
+    done
     for file in "$PHX_UNITS"/phoenix-standalone-*.service; do
         [[ ! -e $file ]] || { fail 'Remove standalone tunnels first.'; return 1; }
     done
-    confirm 'Remove Phoenix core?' || return 0
-    [[ ! -L $(core) ]] || return 1
+    confirm 'Remove Phoenix core and empty directories?' || return 0
+    for file in "$(core)" "$PHX_BASE/core/LICENSE" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"; do
+        [[ ! -L $file && ( ! -e $file || -f $file ) ]] || { fail "Unsafe core file: $file"; return 1; }
+    done
     rm -f -- "$(core)" "$PHX_BASE/core/LICENSE" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"
-    printf 'Core removed. Configurations and saved menu kept.\n'
+    # Never recursively delete configs, the saved menu, or shared OS packages.
+    for file in "$PHX_BASE/core" "$PHX_BASE/configs" "$PHX_BASE"; do
+        [[ ! -d $file ]] || rmdir -- "$file" 2>/dev/null || :
+    done
+    printf 'Core removed. System packages and saved menu kept.\n'
+    [[ ! -d $PHX_BASE ]] || notice 33 'Non-empty directories were kept.'
 }
 manage_menu() {
     local choice role

@@ -57,9 +57,14 @@ Files are kept in:
   configs/
 ```
 
-The core download is checked against a pinned SHA-256. Required tools are
-`curl`, `sha256sum`, `flock`, `jq`, `openssl` and GNU coreutils.
-The menu reports missing tools; it does not install system packages automatically.
+The core download is checked against a pinned SHA-256. On Ubuntu/Debian,
+**Install / update core** also installs missing dependencies such as `jq`,
+`openssl`, `curl` and CA certificates through APT. Other distributions need
+the required tools installed manually.
+
+**Remove core** deletes only the core, its license files and empty Phoenix
+directories, after all standalone tunnels have been removed. System packages,
+the saved menu and non-empty configuration directories are kept.
 
 Keep connection codes private. The destination service must be running on
 Kharej, and the selected transport and public ports must be allowed by your
