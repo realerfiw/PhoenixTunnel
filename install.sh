@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-10
+PHX_REV=standalone-11
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
@@ -119,6 +119,41 @@ heading() {
     printf '\n'
 }
 valid_host() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$ || $1 =~ ^\[[0-9a-fA-F:]+\]$ ]]; }
+public_ipv4() {
+    local value=$1 part
+    local -a octets=()
+    [[ $value =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r -a octets <<< "$value"
+    for part in "${octets[@]}"; do
+        [[ $part == 0 || $part != 0* ]] && ((10#$part <= 255)) || return 1
+    done
+    ((octets[0] > 0 && octets[0] < 224 && octets[0] != 10 && octets[0] != 127)) || return 1
+    [[ $value != 169.254.* && $value != 192.168.* ]] || return 1
+    ! (( (octets[0]==172 && octets[1]>=16 && octets[1]<=31) ||
+         (octets[0]==100 && octets[1]>=64 && octets[1]<=127) ))
+}
+detect_public_ip() {
+    local endpoint detected
+    # Only called when creating Iran, never while opening or refreshing menus.
+    # External IP services receive no configuration, credentials or connection code.
+    for endpoint in https://api.ipify.org https://checkip.amazonaws.com; do
+        detected=$(curl -4 --noproxy '*' --proto '=https' -fsS \
+            --connect-timeout 1 --max-time 2 --max-filesize 64 "$endpoint" 2>/dev/null) || continue
+        detected=${detected%$'\r'}
+        if public_ipv4 "$detected"; then printf '%s' "$detected"; return 0; fi
+    done
+    return 1
+}
+ask_iran_address() {
+    local detected=''
+    detected=$(detect_public_ip) || detected=''
+    if [[ -n $detected ]]; then
+        ask "Iran public IP / hostname [$detected]: " host "$detected" || return 1
+    else
+        ask 'Iran public IP / hostname: ' host || return 1
+    fi
+    valid_host "$host" || { fail 'Invalid IP / hostname.'; return 1; }
+}
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 <= 65535 )); }
 unit_name() { printf 'phoenix-standalone-%s.service' "$1"; }
 safe_dir() {
@@ -317,8 +352,7 @@ create_iran() {
     layout
     safe_dir "$PHX_UNITS"
     local name host port carrier protocol listen target_host target_port more tmp agent token mappings='[]' count=0
-    ask 'Iran public IP / hostname: ' host || return
-    valid_host "$host" || { fail 'Invalid IP / hostname.'; return 1; }
+    ask_iran_address || return
     ask 'Tunnel port [7845]: ' port 7845 || return
     valid_port "$port" || { fail 'Invalid port.'; return 1; }
     port=$((10#$port))
