@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-5
+PHX_REV=standalone-6
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
@@ -24,6 +24,19 @@ option() { paint '36' "$(printf '  %2s' "$1")"; printf '  %s\n' "$2"; }
 fail() { printf 'Phoenix: %s\n' "$*" >&2; return 1; }
 need() { local c; for c; do command -v "$c" >/dev/null || { fail "Required command: $c"; return 1; }; done; }
 ca_ready() { [[ -s /etc/ssl/certs/ca-certificates.crt ]]; }
+quiet_package_step() (
+    local log result=0
+    log=$(mktemp /tmp/phoenix-packages.XXXXXXXX) || return 1
+    trap 'rm -f -- "$log"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    "$@" > "$log" 2>&1 || result=$?
+    if ((result != 0)); then
+        notice 33 'Package error:' >&2
+        tail -n 12 -- "$log" >&2
+    fi
+    return "$result"
+)
 missing_dependency_packages() {
     local entry cmd package
     local -A missing=()
@@ -33,7 +46,7 @@ missing_dependency_packages() {
         base32:coreutils tr:coreutils sha256sum:coreutils timeout:coreutils \
         realpath:coreutils stat:coreutils install:coreutils mktemp:coreutils \
         chmod:coreutils cp:coreutils mv:coreutils rm:coreutils rmdir:coreutils \
-        cat:coreutils dirname:coreutils uname:coreutils; do
+        cat:coreutils dirname:coreutils uname:coreutils tail:coreutils; do
         cmd=${entry%%:*}; package=${entry#*:}
         command -v "$cmd" >/dev/null 2>&1 || missing[$package]=1
     done
@@ -50,15 +63,15 @@ install_dependencies() {
         fail "Install required packages first: ${packages[*]} (automatic setup requires Ubuntu/Debian APT)."
         return 1
     }
-    notice 36 "Installing required packages: ${packages[*]}"
+    notice 36 'Installing dependencies...'
     # Never upgrade the OS, remove packages, bypass signatures or force APT locks.
     # List-only needrestart mode avoids restarting unrelated services.
     DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
-        apt-get -o APT::Update::Error-Mode=any update || {
+        quiet_package_step apt-get -o APT::Update::Error-Mode=any update || {
         fail 'Package index update failed. Core unchanged; retry Install / update core.'; return 1
     }
     DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
-        apt-get -o DPkg::Lock::Timeout=60 install -y --no-install-recommends --no-remove "${packages[@]}" || {
+        quiet_package_step apt-get -o DPkg::Lock::Timeout=60 install -y --no-install-recommends --no-remove "${packages[@]}" || {
         fail 'Dependency installation failed. Core unchanged; retry Install / update core.'; return 1
     }
     hash -r
@@ -180,12 +193,12 @@ install_core() {
     tmp=$(mktemp -d "$PHX_BASE/core/.download.XXXXXXXX")
     PHX_TEMP=$tmp; trap 'rm -rf -- "$PHX_TEMP"' EXIT
     asset=phoenix-linux-$arch
-    notice 36 "[1/3] Downloading Phoenix ${PHX_VERSION#v} ($arch)..."
+    notice 36 'Downloading core...'
     fetch "$PHX_RELEASE/$PHX_VERSION/$asset" "$tmp/phoenix"
     printf '%s  %s\n' "$digest" "$tmp/phoenix" | sha256sum --check --strict --quiet -
     fetch "$PHX_RELEASE/$PHX_VERSION/LICENSE" "$tmp/LICENSE"
     fetch "$PHX_RELEASE/$PHX_VERSION/THIRD-PARTY-LICENSES-linux-$arch.json" "$tmp/THIRD-PARTY-LICENSES.json"
-    notice 36 '[2/3] Verifying release files...'
+    notice 36 'Verifying files...'
     printf '%s  %s\n' 4ac2246b8a312640bc5da2a3d57c81dec1bfe813d2b2e5884883aaf95e753de7 "$tmp/LICENSE" d8fe863575b7eab50193c578392aadb8c3c6c6c6a312f2548b084e27588cb5f1 "$tmp/THIRD-PARTY-LICENSES.json" | sha256sum --check --strict --quiet -
     chmod 0755 "$tmp/phoenix"
     reported=$(timeout 10s "$tmp/phoenix" version)
@@ -194,8 +207,7 @@ install_core() {
     mv -fT "$tmp/phoenix" "$(core)"
     install -m 0644 "$tmp/LICENSE" "$PHX_BASE/core/LICENSE"
     install -m 0644 "$tmp/THIRD-PARTY-LICENSES.json" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"
-    notice 32 "[3/3] Phoenix ${PHX_VERSION#v} installed."
-    printf '  Core: %s\n' "$(core)"
+    notice 32 "Phoenix ${PHX_VERSION#v} installed."
     local unit
     for unit in "$PHX_UNITS"/phoenix-standalone-*.service; do
         if [[ -f $unit ]]; then
@@ -414,27 +426,39 @@ manage_action() {
             printf 'Private connection code:\n'; cat "$PHX_BASE/configs/$selected.code" ;;
     esac
 }
+directory_empty() (
+    shopt -s nullglob dotglob
+    local -a entries=("$1"/*)
+    ((${#entries[@]} == 0))
+)
 remove_core() {
     heading 'Remove Phoenix core'
-    local file
+    local file removable=0
     # Validate existing directories without creating anything during removal.
     for file in "$PHX_BASE" "$PHX_BASE/core" "$PHX_BASE/configs"; do
         if [[ -e $file || -L $file ]]; then safe_dir "$file" || return 1; fi
     done
+    for file in "$(core)" "$PHX_BASE/core/LICENSE" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"; do
+        [[ ! -L $file && ( ! -e $file || -f $file ) ]] || { fail "Unsafe core file: $file"; return 1; }
+        [[ ! -f $file ]] || removable=1
+    done
+    for file in "$PHX_BASE/core" "$PHX_BASE/configs" "$PHX_BASE"; do
+        if [[ -d $file ]] && directory_empty "$file"; then removable=1; fi
+    done
+    if ((removable == 0)); then
+        notice 33 'Nothing to remove.'
+        return 0
+    fi
     for file in "$PHX_UNITS"/phoenix-standalone-*.service; do
         [[ ! -e $file ]] || { fail 'Remove standalone tunnels first.'; return 1; }
     done
-    confirm 'Remove Phoenix core and empty directories?' || return 0
-    for file in "$(core)" "$PHX_BASE/core/LICENSE" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"; do
-        [[ ! -L $file && ( ! -e $file || -f $file ) ]] || { fail "Unsafe core file: $file"; return 1; }
-    done
+    confirm 'Remove Phoenix core files?' || return 0
     rm -f -- "$(core)" "$PHX_BASE/core/LICENSE" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"
     # Never recursively delete configs, the saved menu, or shared OS packages.
     for file in "$PHX_BASE/core" "$PHX_BASE/configs" "$PHX_BASE"; do
         [[ ! -d $file ]] || rmdir -- "$file" 2>/dev/null || :
     done
-    printf 'Core removed. System packages and saved menu kept.\n'
-    [[ ! -d $PHX_BASE ]] || notice 33 'Non-empty directories were kept.'
+    notice 32 'Removed.'
 }
 manage_menu() {
     local choice role
