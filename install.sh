@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-22
+PHX_REV=standalone-23
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -89,7 +89,7 @@ install_dependencies() {
 ask() {
     local prompt=$1 default=${3:-}
     printf '%s' "$prompt"
-    IFS= read -r "$2" || return 1
+    IFS= read -r "$2" || return $?
     [[ ${!2} != :cancel ]] || return 1
     [[ -n ${!2} ]] || printf -v "$2" '%s' "$default"
 }
@@ -104,7 +104,20 @@ confirm() {
         esac
     done
 }
-pause() { local ignored; ask 'Press Enter to return...' ignored || :; }
+menu_ask() {
+    local response result
+    printf '%s' "$1"
+    response=$(
+        trap 'exit 130' INT
+        IFS= read -r response || exit $?
+        printf '%s' "$response"
+    )
+    result=$?
+    ((result == 0)) || return "$result"
+    [[ $response != :cancel ]] || return 1
+    printf -v "$2" '%s' "$response"
+}
+pause() ( trap 'exit 130' INT; local ignored; ask 'Press Enter to return...' ignored || :; )
 invalid_choice() {
     notice 33 "${1:-Invalid option.}"
     sleep 2
@@ -301,6 +314,8 @@ lock_action() {
     # Called as a direct command, not in an if/|| context: errexit applies inside.
     (
         set -e
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
         # util-linux may be missing on a minimal host; bootstrap only on Install.
         if [[ ${1:-} == install_core ]] && ! command -v flock >/dev/null 2>&1; then
             install_dependencies
@@ -1069,7 +1084,7 @@ manage_menu() {
         option 10 'Kharej connection code'
         option 0 'Back'
         printf '\n'
-        ask 'Select option: ' choice || return
+        menu_ask 'Select option: ' choice || return
         case $choice in
             0) return ;;
             1)
@@ -1078,7 +1093,11 @@ manage_menu() {
                 option 2 'Kharej (client)'
                 option 0 'Back'
                 printf '\n'
-                ask 'Select role (1 Iran / 2 Kharej / 0 Back): ' role || return
+                menu_ask 'Select role (1 Iran / 2 Kharej / 0 Back): ' role || {
+                    action_status=$?
+                    if ((action_status == 130)); then continue; fi
+                    return
+                }
                 case $role in
                     1) lock_action create_iran ;;
                     2) lock_action create_kharej ;;
@@ -1088,22 +1107,25 @@ manage_menu() {
             2) lock_action manage_action restart ;;
             3) lock_action manage_action stop ;;
             4) lock_action manage_action remove ;;
-            5) (set -e; manage_action logs) ;;
+            5) (trap 'exit 130' INT; set -e; manage_action logs) ;;
             6) (trap 'exit 130' INT; set -e; manage_action live) ;;
-            7) (set -e; manage_action details) ;;
-            8) (set -e; manage_action check) ;;
-            9) (set -e; manage_action status) ;;
-            10) (set -e; manage_action code) ;;
+            7) (trap 'exit 130' INT; set -e; manage_action details) ;;
+            8) (trap 'exit 130' INT; set -e; manage_action check) ;;
+            9) (trap 'exit 130' INT; set -e; manage_action status) ;;
+            10) (trap 'exit 130' INT; set -e; manage_action code) ;;
             *) invalid_choice; continue ;;
         esac
         action_status=$?
-        # Ctrl+C ends live following, not the management session.
-        if [[ $choice == 6 && $action_status == 130 ]]; then continue; fi
+        # All cancelled actions return directly; real failures still get a pause.
+        if ((action_status == 130)); then continue; fi
         ((action_status == 2)) || pause
     done
 }
 menu() (
-    local choice
+    local choice action_status
+    # Keep the navigation shell alive while foreground action children handle INT.
+    # Interrupted read returns failure, so menu/role inputs navigate back naturally.
+    trap ':' INT
     while :; do
         if core_ready; then refresh_release_status; fi
         heading 'Phoenix Tunnel Menu'
@@ -1114,12 +1136,12 @@ menu() (
         option 3 'Remove core'
         option 0 'Exit'
         printf '\n'
-        ask 'Select option: ' choice || return 0
+        menu_ask 'Select option: ' choice || return 0
         case $choice in
             0|4) return 0 ;;
-            1) lock_action install_core; pause ;;
+            1) lock_action install_core; action_status=$?; ((action_status == 130)) || pause ;;
             2) manage_menu ;;
-            3) lock_action remove_core; pause ;;
+            3) lock_action remove_core; action_status=$?; ((action_status == 130)) || pause ;;
             *) invalid_choice ;;
         esac
     done
