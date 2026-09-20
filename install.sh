@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-2
+PHX_REV=standalone-3
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
@@ -12,6 +12,15 @@ PHX_RAW=https://raw.githubusercontent.com/realerfiw/PhoenixTunnel/main/install.s
 PHX_RELEASE=https://github.com/realerfiw/PhoenixTunnel/releases/download
 PHX_SOURCE=${BASH_SOURCE[0]}
 
+paint() {
+    if [[ -t 1 && -n ${TERM:-} && ${TERM:-} != dumb && ! -v NO_COLOR ]]; then
+        printf '\033[%sm%s\033[0m' "$1" "$2"
+    else
+        printf '%s' "$2"
+    fi
+}
+notice() { paint "$1" "  $2"; printf '\n'; }
+option() { paint '36' "$(printf '  %2s' "$1")"; printf '  %s\n' "$2"; }
 fail() { printf 'Phoenix: %s\n' "$*" >&2; return 1; }
 need() { local c; for c; do command -v "$c" >/dev/null || { fail "Required command: $c"; return 1; }; done; }
 ask() {
@@ -23,8 +32,14 @@ ask() {
 }
 confirm() {
     local answer
-    ask "$1 (Y/n): " answer y || return 1
-    [[ $answer == y || $answer == Y || $answer == yes ]]
+    while :; do
+        ask "$1 (Y/n): " answer y || return 1
+        case ${answer,,} in
+            y|yes) return 0 ;;
+            n|no) return 1 ;;
+            *) notice 33 'Please enter y or n (:cancel to return).' ;;
+        esac
+    done
 }
 pause() { local ignored; ask 'Press Enter to continue...' ignored || :; }
 clear_screen() {
@@ -35,7 +50,12 @@ clear_screen() {
 }
 heading() {
     clear_screen
-    printf '\n=========================================\n%s\n=========================================\n\n' "$1"
+    printf '\n'
+    notice 36 '--------------------------------------------'
+    notice '1;36' 'PHOENIX TUNNEL'
+    notice 37 "$1"
+    notice 36 '--------------------------------------------'
+    printf '\n'
 }
 valid_name() { [[ $1 =~ ^[a-z][a-z0-9-]{0,31}$ ]]; }
 valid_host() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$ || $1 =~ ^\[[0-9a-fA-F:]+\]$ ]]; }
@@ -102,7 +122,7 @@ install_core() {
         aarch64|arm64) arch=arm64; digest=45a9265a1ab740a7d0f4f9278afee875bd6a7ca30606b23ec7be5141e3e3c871 ;;
         *) fail 'Supported architectures: amd64, arm64'; return 1 ;;
     esac
-    confirm "Install core ${PHX_VERSION#v} ($arch)?" || return 0
+    # Selecting Install / update core is the user's confirmation.
     for destination in "$(core)" "$PHX_BASE/core/LICENSE" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"; do
         [[ ! -L $destination && ( ! -e $destination || -f $destination ) ]] ||
             { fail "Unsafe core destination: $destination"; return 1; }
@@ -110,12 +130,13 @@ install_core() {
     tmp=$(mktemp -d "$PHX_BASE/core/.download.XXXXXXXX")
     PHX_TEMP=$tmp; trap 'rm -rf -- "$PHX_TEMP"' EXIT
     asset=phoenix-linux-$arch
-    printf 'Downloading Phoenix %s...\n' "$PHX_VERSION"
+    notice 36 "[1/3] Downloading Phoenix ${PHX_VERSION#v} ($arch)..."
     fetch "$PHX_RELEASE/$PHX_VERSION/$asset" "$tmp/phoenix"
-    printf '%s  %s\n' "$digest" "$tmp/phoenix" | sha256sum -c -
+    printf '%s  %s\n' "$digest" "$tmp/phoenix" | sha256sum --check --strict --quiet -
     fetch "$PHX_RELEASE/$PHX_VERSION/LICENSE" "$tmp/LICENSE"
     fetch "$PHX_RELEASE/$PHX_VERSION/THIRD-PARTY-LICENSES-linux-$arch.json" "$tmp/THIRD-PARTY-LICENSES.json"
-    printf '%s  %s\n' 4ac2246b8a312640bc5da2a3d57c81dec1bfe813d2b2e5884883aaf95e753de7 "$tmp/LICENSE" d8fe863575b7eab50193c578392aadb8c3c6c6c6a312f2548b084e27588cb5f1 "$tmp/THIRD-PARTY-LICENSES.json" | sha256sum -c -
+    notice 36 '[2/3] Verifying release files...'
+    printf '%s  %s\n' 4ac2246b8a312640bc5da2a3d57c81dec1bfe813d2b2e5884883aaf95e753de7 "$tmp/LICENSE" d8fe863575b7eab50193c578392aadb8c3c6c6c6a312f2548b084e27588cb5f1 "$tmp/THIRD-PARTY-LICENSES.json" | sha256sum --check --strict --quiet -
     chmod 0755 "$tmp/phoenix"
     reported=$(timeout 10s "$tmp/phoenix" version)
     [[ $reported == "phoenix ${PHX_VERSION#v} "* ]] || { fail 'Unexpected core version'; return 1; }
@@ -123,8 +144,15 @@ install_core() {
     mv -fT "$tmp/phoenix" "$(core)"
     install -m 0644 "$tmp/LICENSE" "$PHX_BASE/core/LICENSE"
     install -m 0644 "$tmp/THIRD-PARTY-LICENSES.json" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"
-    printf '%s\nInstalled: %s\n' "$reported" "$(core)"
-    printf 'Existing tunnels keep running. Restart selected tunnels to use the new core.\n'
+    notice 32 "[3/3] Phoenix ${PHX_VERSION#v} installed."
+    printf '  Core: %s\n' "$(core)"
+    local unit
+    for unit in "$PHX_UNITS"/phoenix-standalone-*.service; do
+        if [[ -f $unit ]]; then
+            notice 33 'Restart existing tunnels to use the updated core.'
+            break
+        fi
+    done
 }
 new_name() {
     local label=$1
@@ -306,8 +334,8 @@ manage_action() {
     unit=$(unit_name "$selected")
     case $action in
         restart|stop|start)
-            confirm "$action $selected?" || return 0
-            systemctl "$action" "$unit" ;;
+            systemctl "$action" "$unit"
+            notice 32 "$selected: $action completed." ;;
         remove)
             confirm "Remove $selected and its configuration?" || return 0
             owned "$selected" || return 1
@@ -356,18 +384,36 @@ manage_menu() {
             return 0
         fi
         heading 'Phoenix Tunnel Management'
-        printf '%s\n' '1) Create tunnel' '2) Restart tunnel' '3) Stop tunnel' '4) Remove tunnel'             '5) View logs' '6) View live logs' '7) View tunnel details' '8) Health check'             '9) Status' '10) Kharej connection code' '11) Start stopped tunnel' '0) Back'
-        ask 'Choice: ' choice || return
+        option 1 'Create tunnel'
+        option 2 'Restart tunnel'
+        option 3 'Stop tunnel'
+        option 4 'Remove tunnel'
+        printf '\n'
+        option 5 'View logs'
+        option 6 'View live logs'
+        option 7 'View tunnel details'
+        option 8 'Health check'
+        option 9 'Status'
+        option 10 'Kharej connection code'
+        option 11 'Start stopped tunnel'
+        printf '\n'
+        option 12 'Back'
+        printf '\n'
+        ask '  Select an option: ' choice || return
         case $choice in
-            0) return ;;
+            0|12) return ;;
             1)
                 heading 'Create Phoenix tunnel'
-                printf '\n1) Iran (server)\n2) Kharej (client)\n0) Back\n'
-                ask 'Role: ' role || return
+                option 1 'Iran (server)'
+                option 2 'Kharej (client)'
+                option 3 'Back'
+                printf '\n'
+                ask '  Select a role: ' role || return
                 case $role in
                     1) lock_action create_iran ;;
                     2) lock_action create_kharej ;;
-                    *) continue ;;
+                    0|3) continue ;;
+                    *) notice 33 'Invalid option.'; pause; continue ;;
                 esac ;;
             2) lock_action manage_action restart ;;
             3) lock_action manage_action stop ;;
@@ -379,7 +425,7 @@ manage_menu() {
             9) (set -e; manage_action status) ;;
             10) (set -e; manage_action code) ;;
             11) lock_action manage_action start ;;
-            *) printf 'Invalid option.\n'; continue ;;
+            *) notice 33 'Invalid option.'; pause; continue ;;
         esac
         pause
     done
@@ -388,15 +434,21 @@ menu() {
     local choice
     while :; do
         heading 'Phoenix Tunnel'
-        if core_ready; then printf 'Core: Installed\n'; else printf 'Core: Not installed\n'; fi
-        printf '\n1) Install / update core\n2) Manage tunnels\n3) Remove core\n0) Exit\n'
-        ask 'Choice: ' choice || return 0
+        if core_ready; then notice 32 'Core: Installed'; else notice 33 'Core: Not installed'; fi
+        printf '\n'
+        option 1 'Install / update core'
+        option 2 'Manage tunnels'
+        option 3 'Remove core'
+        printf '\n'
+        option 4 'Exit'
+        printf '\n'
+        ask '  Select an option: ' choice || return 0
         case $choice in
-            0) return 0 ;;
+            0|4) return 0 ;;
             1) lock_action install_core; pause ;;
             2) manage_menu ;;
             3) lock_action remove_core; pause ;;
-            *) printf 'Invalid option.\n' ;;
+            *) notice 33 'Invalid option.'; pause ;;
         esac
     done
 }
