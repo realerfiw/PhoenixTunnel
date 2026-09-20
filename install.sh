@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-9
+PHX_REV=standalone-10
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
@@ -20,7 +20,12 @@ paint() {
     fi
 }
 notice() { paint "$1" "  $2"; printf '\n'; }
-option() { paint '36' "$(printf '  %2s' "$1")"; printf '  %s\n' "$2"; }
+option() {
+    local color=35
+    [[ $1 != 0 ]] || color=31
+    paint "$color" "  $1)"; printf ' %s\n' "$2"
+}
+separator() { notice 36 '========================================='; }
 fail() { printf 'Phoenix: %s\n' "$*" >&2; return 1; }
 need() { local c; for c; do command -v "$c" >/dev/null || { fail "Required command: $c"; return 1; }; done; }
 ca_ready() { [[ -s /etc/ssl/certs/ca-certificates.crt ]]; }
@@ -108,9 +113,10 @@ clear_screen() {
 }
 heading() {
     clear_screen
-    notice 36 '--------------------------------------------'
-    notice '1;36' "$1"
-    notice 36 '--------------------------------------------'
+    separator
+    notice '1;37' "$1"
+    separator
+    printf '\n'
 }
 valid_host() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$ || $1 =~ ^\[[0-9a-fA-F:]+\]$ ]]; }
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 <= 65535 )); }
@@ -396,7 +402,7 @@ create_kharej() {
     notice 36 'Creating tunnel...'
     commit_tunnel client "$name" "$tmp"
 }
-owned() {
+owned_files() {
     local name=$1 unit
     [[ $name =~ ^(iran|kharej)-[a-z][a-z0-9-]{0,31}$ ]] || return 1
     unit=$(unit_name "$name")
@@ -405,43 +411,114 @@ owned() {
     grep -Fqx "EnvironmentFile=$PHX_BASE/configs/$name.env" "$PHX_UNITS/$unit" || return 1
     local mode=server; [[ $name == iran-* ]] || mode=client
     grep -Fqx "ExecStart=$(core) $mode --config $PHX_BASE/configs/$name.json" "$PHX_UNITS/$unit" || return 1
+}
+owned() {
+    local name=$1 unit
+    owned_files "$name" || return 1
+    unit=$(unit_name "$name")
     # Drop-ins may redirect the executable; do not manage such a service.
     [[ -z $(systemctl show "$unit" -p DropInPaths --value) ]] || return 1
     [[ $(systemctl show "$unit" -p FragmentPath --value) == "$PHX_UNITS/$unit" ]] || return 1
 }
+collect_tunnels() {
+    # Display-only snapshot: one systemd query for the whole screen. Actions
+    # revalidate ownership separately; a status label is never authorization.
+    local path name unit snapshot key value id='' active='' load='' fragment='' drops='' index
+    local -a units=()
+    local -A indexes=()
+    tunnel_names=(); tunnel_states=()
+    for path in "$PHX_UNITS"/phoenix-standalone-*.service; do
+        [[ -f $path && ! -L $path ]] || continue
+        name=${path##*/phoenix-standalone-}; name=${name%.service}
+        [[ $name =~ ^(iran|kharej)-[a-z][a-z0-9-]{0,31}$ ]] || continue
+        grep -qx '# PHOENIX_STANDALONE_UNIT_V1' "$path" || continue
+        unit=$(unit_name "$name")
+        indexes[$unit]=${#tunnel_names[@]}
+        tunnel_names+=("$name"); units+=("$unit")
+        if owned_files "$name" && [[ -f $PHX_BASE/configs/$name.json && ! -L $PHX_BASE/configs/$name.json && -f $PHX_BASE/configs/$name.env && ! -L $PHX_BASE/configs/$name.env ]]; then
+            tunnel_states+=(UNKNOWN)
+        else tunnel_states+=(INCOMPLETE); fi
+    done
+    ((${#units[@]})) || return 0
+    snapshot=$(systemctl show --no-pager --property=Id,LoadState,ActiveState,FragmentPath,DropInPaths -- "${units[@]}" 2>/dev/null) || return 0
+    while IFS='=' read -r key value; do
+        case $key in
+            Id) id=$value ;;
+            ActiveState) active=$value ;;
+            LoadState) load=$value ;;
+            FragmentPath) fragment=$value ;;
+            DropInPaths) drops=$value ;;
+            '')
+                if [[ $id =~ ^phoenix-standalone-(iran|kharej)-[a-z][a-z0-9-]{0,31}\.service$ && -v indexes[$id] ]]; then
+                    index=${indexes[$id]}
+                    if [[ ${tunnel_states[index]} != INCOMPLETE && $load == loaded && $fragment == "$PHX_UNITS/$id" && -z $drops ]]; then
+                        case $active in
+                            active) tunnel_states[index]=UP ;;
+                            inactive|failed) tunnel_states[index]=DOWN ;;
+                            *) tunnel_states[index]=UNKNOWN ;;
+                        esac
+                    fi
+                fi
+                id=''; active=''; load=''; fragment=''; drops='' ;;
+        esac
+    done <<< "$snapshot"$'\n'
+}
+render_tunnels() {
+    local index color state
+    if ((${#tunnel_names[@]} == 0)); then
+        notice 33 'No tunnels yet.'
+        notice 37 'Choose Create tunnel to get started.'
+        return 0
+    fi
+    for ((index=0; index<${#tunnel_names[@]}; index++)); do
+        state=${tunnel_states[index]}
+        case $state in UP) color=32 ;; DOWN) color=31 ;; *) color=33 ;; esac
+        paint 35 "  $((index+1))) "
+        paint 33 "$(unit_name "${tunnel_names[index]}")"
+        printf ' ['; paint "$color" "$state"; printf ']\n'
+    done
+}
 select_tunnel() {
     heading "${1:-Select Phoenix tunnel}"
     need systemctl || return
-    local path name n=0 choice
-    local -a names=()
-    for path in "$PHX_UNITS"/phoenix-standalone-*.service; do
-        [[ -f $path ]] || continue
-        name=${path##*/phoenix-standalone-}; name=${name%.service}
-        owned "$name" || continue
-        names+=("$name"); n=$((n+1))
-        printf '%s) %s [%s]\n' "$n" "$name" "$(systemctl is-active "$(unit_name "$name")" 2>/dev/null || :)"
-    done
-    if ((n == 0)); then
-        notice 33 'No tunnels yet.'
-        notice 37 'Choose Create tunnel to get started.'
-        return 1
-    fi
+    local choice
+    local -a tunnel_names=() tunnel_states=()
+    collect_tunnels
+    if ((${#tunnel_names[@]} == 0)); then render_tunnels; return 1; fi
+    notice 37 'Existing Phoenix tunnels:'
+    render_tunnels
     option 0 'Back'
-    ask 'Tunnel number (0 = back): ' choice || return
-    [[ $choice =~ ^[0-9]{1,3}$ ]] && ((10#$choice>0 && 10#$choice<=n)) || return 1
-    selected=${names[10#$choice-1]}
+    printf '\n'
+    while :; do
+        ask 'Enter tunnel number: ' choice || return 1
+        [[ $choice != 0 ]] || return 2
+        if [[ $choice =~ ^[0-9]{1,5}$ ]] && ((10#$choice>0 && 10#$choice<=${#tunnel_names[@]})); then
+            selected=${tunnel_names[10#$choice-1]}
+            return 0
+        fi
+        notice 33 'Invalid tunnel number. Select a displayed number, or 0 to return.'
+    done
 }
 manage_action() {
-    local action=$1 selected unit mode suffix
-    select_tunnel "Phoenix tunnel: $action" || return 0
-    notice 36 "Tunnel: $selected"
+    local action=$1 selected unit mode suffix title result
+    case $action in
+        restart) title='Restart Phoenix Tunnel' ;; stop) title='Stop Phoenix Tunnel' ;;
+        remove) title='Remove Phoenix Tunnel' ;; logs) title='Phoenix Tunnel Logs' ;;
+        live) title='Live Phoenix Tunnel Logs' ;; details) title='Phoenix Tunnel Details' ;;
+        check) title='Phoenix Health Check' ;; status) title='Phoenix Tunnel Status' ;;
+        code) title='Kharej Connection Code' ;; *) return 1 ;;
+    esac
+    select_tunnel "$title" || { result=$?; [[ $result != 2 ]] || return 2; return 0; }
+    owned "$selected" || { fail 'Tunnel configuration changed or needs review. No action taken.'; return 1; }
     unit=$(unit_name "$selected")
+    separator
+    notice 37 "Tunnel: $unit"
     case $action in
         restart|stop)
             systemctl "$action" "$unit"
             notice 32 "$selected: $action completed." ;;
         remove)
-            confirm "Remove $selected and its configuration?" || return 0
+            confirm "Remove tunnel '$unit'?" || return 0
             owned "$selected" || return 1
             systemctl stop "$unit"
             systemctl disable "$unit"
@@ -451,9 +528,9 @@ manage_action() {
                 rm -f -- "$PHX_BASE/configs/$selected.$suffix"
             done
             systemctl daemon-reload
-            printf 'Removed: %s (no backup).\n' "$selected" ;;
+            notice 32 'Tunnel removed.' ;;
         logs) journalctl --no-pager -n 80 -u "$unit" ;;
-        live) journalctl --no-pager -n 20 -f -u "$unit" ;;
+        live) notice 37 'Press Ctrl+C to return to previous menu'; journalctl --no-pager -n 20 -f -u "$unit" ;;
         status) systemctl --no-pager --full status "$unit" ;;
         details)
             need jq
@@ -503,15 +580,17 @@ remove_core() {
     notice 32 'Removed.'
 }
 manage_menu() {
-    local choice role
+    local choice role action_status
+    local -a tunnel_names=() tunnel_states=()
     while :; do
         if ! require_core; then
             pause
             return 0
         fi
         heading 'Phoenix Tunnel Management'
-        core_status
-        printf '\n'
+        collect_tunnels
+        render_tunnels
+        separator
         option 1 'Create tunnel'
         option 2 'Restart tunnel'
         option 3 'Stop tunnel'
@@ -519,21 +598,21 @@ manage_menu() {
         option 5 'View logs'
         option 6 'View live logs'
         option 7 'View tunnel details'
-        option 8 'Health check'
+        option 8 'Health Check'
         option 9 'Status'
         option 10 'Kharej connection code'
         option 0 'Back'
         printf '\n'
-        ask '  Select an option: ' choice || return
+        ask '-> Please select an option: ' choice || return
         case $choice in
             0) return ;;
             1)
-                heading 'Create Phoenix tunnel'
-                option 1 'Iran (server)'
+                heading 'Create Phoenix Tunnel'
+                option 1 'Iran   (server)'
                 option 2 'Kharej (client)'
                 option 0 'Back'
                 printf '\n'
-                ask '  Select a role: ' role || return
+                ask '-> Please select tunnel role: ' role || return
                 case $role in
                     1) lock_action create_iran ;;
                     2) lock_action create_kharej ;;
@@ -551,21 +630,22 @@ manage_menu() {
             10) (set -e; manage_action code) ;;
             *) notice 33 'Invalid option.'; pause; continue ;;
         esac
-        pause
+        action_status=$?
+        ((action_status == 2)) || pause
     done
 }
 menu() {
     local choice
     while :; do
-        heading 'Phoenix Tunnel'
+        heading 'Phoenix Tunnel Menu'
         core_status
-        printf '\n'
+        separator
         option 1 'Install / update core'
         option 2 'Manage tunnels'
         option 3 'Remove core'
-        option 4 'Exit'
+        option 0 'Exit'
         printf '\n'
-        ask '  Select an option: ' choice || return 0
+        ask '-> Please select an option: ' choice || return 0
         case $choice in
             0|4) return 0 ;;
             1) lock_action install_core; pause ;;

@@ -49,6 +49,8 @@ is named automatically by role, carrier and tunnel port (for example,
 `iran-auto-9090`), with a numeric suffix when needed. Each has its own
 configuration. Manage tunnels provides restart, stop,
 remove, logs, details, validation and status actions.
+Its main screen lists installed tunnels with their local service status
+(`UP`, `DOWN`, `INCOMPLETE` or `UNKNOWN`). Back and Exit use `0`.
 
 Files are kept in:
 
