@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-18
+PHX_REV=standalone-19
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -130,7 +130,57 @@ heading() {
     fi
     printf '\n'
 }
-valid_host() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$ || $1 =~ ^\[[0-9a-fA-F:]+\]$ ]]; }
+valid_host() {
+    local value=$1 part rest count=0
+    local -a parts=()
+    if [[ $value == \[*\] ]]; then
+        value=${value:1:${#value}-2}
+        [[ $value == *:* && $value != *:::* && $value != *[!0-9a-fA-F:]* ]] || return 1
+        rest=${value/::/X}
+        [[ $rest != *::* ]] || return 1
+        if [[ $value != *::* && ( $value == :* || $value == *: ) ]]; then return 1; fi
+        IFS=: read -r -a parts <<< "$value"
+        for part in "${parts[@]}"; do
+            [[ -n $part ]] || continue
+            ((${#part} <= 4)) || return 1
+            count=$((count+1))
+        done
+        if [[ $value == *::* ]]; then ((count < 8)); else ((count == 8)); fi
+        return
+    fi
+    if [[ $value =~ ^[0-9.]+$ ]]; then
+        [[ $value =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+        IFS=. read -r -a parts <<< "$value"
+        for part in "${parts[@]}"; do
+            [[ $part == 0 || $part != 0* ]] && ((10#$part <= 255)) || return 1
+        done
+        return 0
+    fi
+    ((${#value} <= 253)) || return 1
+    value=${value%.}
+    [[ -n $value && $value != .* && $value != *..* ]] || return 1
+    IFS=. read -r -a parts <<< "$value"
+    for part in "${parts[@]}"; do
+        [[ $part =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || return 1
+    done
+}
+ask_choice() {
+    local prompt=$1 variable=$2 default=$3 allowed=$4
+    while :; do
+        ask "$prompt" "$variable" "$default" || return 1
+        printf -v "$variable" '%s' "${!variable,,}"
+        [[ " $allowed " != *" ${!variable} "* ]] || return 0
+        notice 33 "Choose: $allowed"
+    done
+}
+ask_host() {
+    local prompt=$1 variable=$2 default=${3:-}
+    while :; do
+        ask "$prompt" "$variable" "$default" || return 1
+        valid_host "${!variable}" && return 0
+        notice 33 'Invalid IP / hostname. Use brackets for IPv6.'
+    done
+}
 public_ipv4() {
     local value=$1 part
     local -a octets=()
@@ -160,9 +210,9 @@ ask_iran_address() {
     local detected=''
     detected=$(detect_public_ip) || detected=''
     if [[ -n $detected ]]; then
-        ask "Public IP [$detected]: " host "$detected" || return 1
+        ask_host "Public IP [$detected]: " host "$detected" || return 1
     else
-        ask 'Public IP: ' host || return 1
+        ask_host 'Public IP: ' host || return 1
     fi
     valid_host "$host" || { fail 'Invalid IP / hostname.'; return 1; }
 }
@@ -204,7 +254,12 @@ latest_core_release() {
     # /latest excludes development releases. Never download a core from this response.
     curl --proto '=https' -fsS --connect-timeout 1 --max-time 2 --max-filesize 262144 \
         'https://api.github.com/repos/realerfiw/PhoenixTunnel/releases?per_page=30' 2>/dev/null |
-        jq -er '[.[] | select(.draft == false) | select(.tag_name | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+(-dev\\.[0-9]+)?$"))] | sort_by(.published_at) | last | .tag_name | ltrimstr("v")' 2>/dev/null
+        jq -er '[.[] | select(.draft == false and .published_at != null) |
+          .tag_name | ltrimstr("v") | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+(-dev\\.[0-9]+)?$")) |
+          . as $version | capture("^(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)(-dev\\.(?<dev>[0-9]+))?$") |
+          {version:$version,key:[(.major|tonumber),(.minor|tonumber),(.patch|tonumber),
+            (if .dev==null then 1 else 0 end),((.dev // "0")|tonumber)]}] |
+          sort_by(.key) | last | .version // empty' 2>/dev/null
 }
 version_key() {
     local version=$1 main=${1%%-*} stable=1 dev=0
@@ -477,7 +532,7 @@ write_config() {
            {agent_credentials:[{agent_id:.agent,token_env:"PHOENIX_TOKEN"}]}
            else {agent_id:.agent,token_env:"PHOENIX_TOKEN"} end)}
          + (if $mode=="server" then
-             {server:{carrier_listen:("0.0.0.0:"+(.port|tostring)),
+              {server:{carrier_listen:((if (.host|startswith("[")) then "[::]:" else "0.0.0.0:" end)+(.port|tostring)),
                 certificate_file:($prefix+".crt"),private_key_file:($prefix+".key")}}
             else {client:{server_address:(.host+":"+(.port|tostring)),
                 server_name:"phoenix.internal",ca_file:($prefix+".crt")}} end)
@@ -688,23 +743,29 @@ create_iran() {
     local name host port carrier protocol listen target_host target_port more tmp agent token mappings='[]' count=0
     ask_iran_address || return
     ask_tunnel_port || return 1
-    ask 'Transport (auto/h2/h3) [auto]: ' carrier auto || return
-    [[ $carrier == auto || $carrier == h2 || $carrier == h3 ]] || return 1
+    ask_choice 'Transport (auto/h2/h3) [auto]: ' carrier auto 'auto h2 h3' || return
     connection_available iran "$port" || return 1
     automatic_name iran "$carrier" "$port" || return 1
     while :; do
-        ask 'Protocol (tcp/udp) [tcp]: ' protocol tcp || return
-        [[ $protocol == tcp || $protocol == udp ]] || return 1
-        [[ $carrier != h3 || $protocol == udp ]] || { fail 'Use auto/h2 for TCP in this setup.'; return 1; }
+        if [[ $carrier == h3 ]]; then
+            protocol=udp
+            notice 37 'Protocol: UDP (H3)'
+        else
+            ask_choice 'Protocol (tcp/udp) [tcp]: ' protocol tcp 'tcp udp' || return
+        fi
         ask_mapping_port || return 1
-        ask 'Kharej target IP [127.0.0.1]: ' target_host 127.0.0.1 || return
-        ask 'Kharej target port: ' target_port || return
+        ask_host 'Kharej target IP [127.0.0.1]: ' target_host 127.0.0.1 || return
+        while :; do
+            ask 'Kharej target port: ' target_port || return
+            valid_port "$target_port" && break
+            notice 33 'Invalid port. Enter a port from 1 to 65535.'
+        done
         valid_port "$listen" && valid_port "$target_port" && valid_host "$target_host" || { fail 'Invalid mapping.'; return 1; }
         listen=$((10#$listen)); target_port=$((10#$target_port))
         [[ $listen != "$port" ]] || { fail 'Public port must differ from tunnel port.'; return 1; }
         count=$((count+1)); ((count<=64)) || { fail 'At most 64 mappings.'; return 1; }
         mappings=$(printf '%s' "$mappings" | jq -c --arg name "port$count" --arg p "$protocol" --arg l "0.0.0.0:$listen" --arg t "$target_host:$target_port" '.+[{name:$name,protocol:$p,listen:$l,target:$t}]')
-        ask 'Add another port? (y/N): ' more n || return
+        ask_choice 'Add another port? (y/N): ' more n 'y n' || return
         [[ $more == y || $more == Y ]] || break
     done
     printf '\nIran: %s:%s | %s | %s mapping(s)\n' "$host" "$port" "$carrier" "$count"
@@ -755,6 +816,7 @@ create_kharej() {
     PHX_TEMP=$tmp; trap 'rm -rf -- "$PHX_TEMP"' EXIT
     umask 077
     decode_code "$code" "$tmp/payload" || return 1
+    valid_host "$(jq -r .host "$tmp/payload")" || { fail 'Invalid Iran address in connection code.'; return 1; }
     carrier=$(jq -r .carrier "$tmp/payload")
     port=$(jq -r .port "$tmp/payload")
     address=$(jq -r '.host+":"+(.port|tostring)' "$tmp/payload")
@@ -830,7 +892,7 @@ collect_tunnels() {
     done <<< "$snapshot"$'\n'
 }
 render_tunnels() {
-    local index color state
+    local index color state label
     if ((${#tunnel_names[@]} == 0)); then
         notice 33 'No tunnels yet.'
         notice 37 'Choose Create tunnel to get started.'
@@ -838,11 +900,13 @@ render_tunnels() {
     fi
     for ((index=0; index<${#tunnel_names[@]}; index++)); do
         state=${tunnel_states[index]}
+        case $state in UP) label='RUNNING' ;; DOWN) label='STOPPED' ;; *) label=$state ;; esac
         case $state in UP) color=32 ;; DOWN) color=31 ;; *) color=33 ;; esac
         paint 35 "  $((index+1))) "
         paint 33 "$(unit_name "${tunnel_names[index]}")"
-        printf ' ['; paint "$color" "$state"; printf ']\n'
+        printf ' ['; paint "$color" "$label"; printf ']\n'
     done
+    notice 37 'Service state only; connection is not verified.'
 }
 select_tunnel() {
     heading "${1:-Select Phoenix tunnel}"
