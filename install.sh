@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-7
+PHX_REV=standalone-8
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
@@ -221,6 +221,10 @@ new_name() {
     ask 'Tunnel name (letters, numbers, hyphens): ' name || return 1
     valid_name "$name" || { fail 'Use 1-32 lowercase characters, starting with a letter.'; return 1; }
     name="$label-$name"
+    name_available "$name"
+}
+name_available() {
+    local name=$1
     local f
     for f in "$PHX_BASE/configs/$name".*; do
         [[ ! -e $f && ! -L $f ]] || { fail 'That tunnel name already exists.'; return 1; }
@@ -345,18 +349,20 @@ create_kharej() {
     need jq openssl base32 systemctl install chmod mktemp
     require_core; layout; safe_dir "$PHX_UNITS"
     local name code tmp
-    new_name kharej || return
     ask 'Paste Iran connection code: ' code || return
     tmp=$(mktemp -d "$PHX_BASE/configs/.setup.XXXXXXXX"); chmod 0700 "$tmp"
     PHX_TEMP=$tmp; trap 'rm -rf -- "$PHX_TEMP"' EXIT
     umask 077
-    decode_code "$code" "$tmp/payload"
+    decode_code "$code" "$tmp/payload" || return 1
+    # Stable identity from validated settings: same code cannot overwrite a tunnel.
+    # Include an agent fragment so independent Iran tunnels can share a port.
+    name=$(jq -r '"kharej-"+.carrier+"-"+(.port|tostring)+"-"+.agent[0:12]' "$tmp/payload")
+    name_available "$name" || return 1
     jq -r .ca "$tmp/payload" > "$tmp/tls.crt"
     openssl x509 -in "$tmp/tls.crt" -noout >/dev/null
     jq -r '"PHOENIX_TOKEN="+.token' "$tmp/payload" > "$tmp/config.env"
     printf '\n'; jq -r '"Iran: "+.host+":"+(.port|tostring), (.mappings[]|.protocol+" "+.listen+" -> "+.target)' "$tmp/payload"
-    printf 'Creates and starts this tunnel; enables startup after reboot.\n'
-    confirm 'Create tunnel?' || return 0
+    notice 36 'Creating tunnel...'
     commit_tunnel client "$name" "$tmp"
 }
 owned() {
