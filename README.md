@@ -34,3 +34,15 @@ chmod 755 phoenix-linux-amd64
 ```
 
 For ARM64, use `phoenix-linux-arm64` instead.
+
+## Install the core
+
+On a supported Linux host, run:
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/realerfiw/PhoenixTunnel/main/install.sh)
+```
+
+The installer detects the host architecture, verifies the downloaded core with
+`SHA256SUMS`, and installs it as `/opt/tunnel-manager/cores/phoenix`. It does
+not create, remove, start, stop, or restart any tunnel service.
