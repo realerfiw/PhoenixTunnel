@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-14
+PHX_REV=standalone-15
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -46,7 +46,7 @@ quiet_package_step() (
 missing_dependency_packages() {
     local entry cmd package
     local -A missing=()
-    for entry in curl:curl jq:jq openssl:openssl flock:util-linux \
+    for entry in curl:curl jq:jq openssl:openssl flock:util-linux ss:iproute2 \
         systemctl:systemd journalctl:systemd grep:grep \
         update-ca-certificates:ca-certificates \
         base32:coreutils tr:coreutils sha256sum:coreutils timeout:coreutils \
@@ -57,7 +57,7 @@ missing_dependency_packages() {
         command -v "$cmd" >/dev/null 2>&1 || missing[$package]=1
     done
     ca_ready || missing[ca-certificates]=1
-    for package in curl jq openssl util-linux systemd grep ca-certificates coreutils; do
+    for package in curl jq openssl util-linux iproute2 systemd grep ca-certificates coreutils; do
         [[ ! -v missing[$package] ]] || printf '%s\n' "$package"
     done
 }
@@ -311,6 +311,69 @@ connection_available() {
     done
     return 0
 }
+port_available() {
+    local requested=$1 config conflict sockets
+    for config in "$PHX_BASE/configs/iran-"*.json; do
+        [[ -e $config || -L $config ]] || continue
+        [[ -f $config && ! -L $config ]] || return 2
+        conflict=$(jq -ser --arg port "$requested" '
+          if length!=1 or (.[0]|type)!="object" then error("invalid config") else .[0] end |
+          ([.server.carrier_listen, .mappings[]?.listen] | map(select(type=="string")|split(":")|last) | index($port)) != null
+          | tostring' "$config") || return 2
+        [[ $conflict != true ]] || return 1
+    done
+    command -v ss >/dev/null || { fail 'Required command: ss. Run Install / update core first.'; return 2; }
+    sockets=$(ss -H -lntu "sport = :$requested" 2>/dev/null) || return 2
+    [[ -z $sockets ]]
+}
+ask_tunnel_port() {
+    local result
+    while :; do
+        ask 'Tunnel port [7845]: ' port 7845 || return 1
+        if ! valid_port "$port"; then notice 33 'Invalid port. Enter a port from 1 to 65535.'; continue; fi
+        port=$((10#$port))
+        if port_available "$port"; then return 0; else result=$?; fi
+        if ((result == 1)); then notice 33 "Port $port is already in use or reserved. Enter another port."
+        else fail 'Unable to check ports. No tunnel created.'; return 1; fi
+    done
+}
+health_check() {
+    local name=$1 unit config mode state pid sockets address protocol port owner failures=0
+    unit=$(unit_name "$name"); config="$PHX_BASE/configs/$name.json"
+    need jq ss timeout || return 1
+    if timeout 10s "$(core)" validate --config "$config" --environment "$PHX_BASE/configs/$name.env" >/dev/null 2>&1; then
+        notice 32 '[PASS] Configuration'
+    else notice 31 '[FAIL] Configuration (use Details to inspect paths and settings)'; return 1; fi
+    state=$(systemctl is-active "$unit" 2>/dev/null) || state=${state:-unknown}
+    pid=$(systemctl show "$unit" -p MainPID --value) || pid=0
+    if [[ $state == active && $pid =~ ^[1-9][0-9]*$ ]]; then notice 32 "[PASS] Service running · PID $pid"
+    else notice 31 "[FAIL] Service: $state"; failures=1; fi
+    mode=$(jq -r .mode "$config") || return 1
+    if [[ $mode == server ]]; then
+        while IFS=$'\t' read -r protocol address; do
+            port=${address##*:}
+            if [[ $protocol == tcp ]]; then owner=-lntp; else owner=-lnup; fi
+            if sockets=$(ss -H "$owner" "sport = :$port" 2>/dev/null); then
+                if [[ $pid != 0 && $sockets == *"pid=$pid,"* ]]; then notice 32 "[PASS] $protocol listener · $address"
+                elif [[ $protocol == udp-auto ]]; then notice 33 "[INFO] Optional H3 listener not observed · $address"
+                else notice 31 "[FAIL] $protocol listener not owned by this service · $address"; failures=1; fi
+            else notice 33 "[UNKNOWN] Cannot inspect $protocol listener · $address"; failures=1; fi
+        done < <(jq -r '([if .carrier!="h3" then ["tcp",.server.carrier_listen] else empty end,
+            if .carrier=="h3" then ["udp",.server.carrier_listen] elif .carrier=="auto" then ["udp-auto",.server.carrier_listen] else empty end] +
+            [.mappings[]|[.protocol,.listen]])[]|@tsv' "$config")
+    else
+        address=$(jq -r .client.server_address "$config")
+        notice 37 "Iran endpoint: $address"
+        sockets=$(ss -H -ntp state established 2>/dev/null) || sockets=''
+        if [[ $pid != 0 && $sockets == *"pid=$pid,"* ]]; then
+            notice 37 '[INFO] Process has established TCP sockets; this does not prove tunnel authentication.'
+        else notice 33 '[UNKNOWN] No established TCP socket observed (H3 uses UDP).'; fi
+        jq -r '.mappings[]|"  Target: "+.protocol+" "+.target' "$config"
+    fi
+    notice 33 '[NOT TESTED] End-to-end forwarding, peer authentication and destination response.'
+    notice 37 'Use an actual connection through an Iran forwarded port to verify data transfer.'
+    ((failures == 0))
+}
 write_config() {
     local mode=$1 payload=$2 prefix=$3 output=$4
     jq --arg mode "$mode" --arg prefix "$prefix" '
@@ -463,6 +526,11 @@ commit_tunnel() {
     local mode=$1 name=$2 tmp=$3 suffix unit
     unit=$(unit_name "$name")
     # All paths are generated locally. Incoming codes cannot set file paths or units.
+    if [[ $mode == server ]]; then
+        local requested_port
+        requested_port=$(jq -r .port "$tmp/payload") || return 1
+        port_available "$requested_port" || { fail "Port $requested_port is no longer available. Choose another port."; return 1; }
+    fi
     write_config "$mode" "$tmp/payload" "$tmp/tls" "$tmp/validate.json"
     "$(core)" validate --mode "$mode" --config "$tmp/validate.json" --environment "$tmp/config.env"
     prepare_log_policy || return 1
@@ -490,9 +558,7 @@ create_iran() {
     safe_dir "$PHX_UNITS"
     local name host port carrier protocol listen target_host target_port more tmp agent token mappings='[]' count=0
     ask_iran_address || return
-    ask 'Tunnel port [7845]: ' port 7845 || return
-    valid_port "$port" || { fail 'Invalid port.'; return 1; }
-    port=$((10#$port))
+    ask_tunnel_port || return 1
     ask 'Transport (auto/h2/h3) [auto]: ' carrier auto || return
     [[ $carrier == auto || $carrier == h2 || $carrier == h3 ]] || return 1
     connection_available iran "$port" || return 1
@@ -708,10 +774,7 @@ manage_action() {
             need jq
             printf 'Service: %s\nConfig: %s/configs/%s.json\n' "$unit" "$PHX_BASE" "$selected"
             jq '{mode,carrier,mappings,server:(.server//null),client:(.client//null)}' "$PHX_BASE/configs/$selected.json" ;;
-        check)
-            require_core
-            "$(core)" validate --config "$PHX_BASE/configs/$selected.json" --environment "$PHX_BASE/configs/$selected.env"
-            systemctl is-active "$unit" ;;
+        check) require_core; health_check "$selected" ;;
         code)
             [[ $selected == iran-* && -f "$PHX_BASE/configs/$selected.code" ]] || { fail 'Select an Iran tunnel to display its code.'; return 1; }
             printf 'Private connection code:\n'; cat "$PHX_BASE/configs/$selected.code" ;;

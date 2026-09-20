@@ -52,6 +52,13 @@ remove, logs, details, validation and status actions.
 Its main screen lists installed tunnels with their local service status
 (`UP`, `DOWN`, `INCOMPLETE` or `UNKNOWN`). Back and Exit use `0`.
 
+Iran tunnel ports are checked against saved Iran listeners/mappings and active
+TCP/UDP listeners; an occupied port prompts for another value. The check is
+repeated before installation. `ss` (iproute2) is installed with missing dependencies.
+Health check reports config validity, service PID and server listener ownership.
+Client socket observations are informational, not proof of authentication or
+end-to-end forwarding; those require a real request through a forwarded port.
+
 Files are kept in:
 
 ```text
