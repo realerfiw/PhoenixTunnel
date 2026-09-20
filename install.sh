@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-15
+PHX_REV=standalone-16
 PHX_JOURNAL_ROOT=/etc/systemd
 PHX_VERSION=v0.1.0-dev.69
 PHX_BASE=/opt/phoenix-tunnel
@@ -105,6 +105,10 @@ confirm() {
     done
 }
 pause() { local ignored; ask 'Press Enter to return...' ignored || :; }
+invalid_choice() {
+    notice 33 "${1:-Invalid option.}"
+    sleep 2
+}
 clear_screen() {
     # Do not put terminal control bytes into redirected logs or test output.
     if [[ -t 1 && -n ${TERM:-} && ${TERM:-} != dumb ]]; then
@@ -733,7 +737,12 @@ select_tunnel() {
             selected=${tunnel_names[10#$choice-1]}
             return 0
         fi
-        notice 33 'Invalid tunnel number. Select a displayed number, or 0 to return.'
+        invalid_choice 'Invalid tunnel number. Select a displayed number, or 0 to return.'
+        heading "${1:-Select Phoenix tunnel}"
+        notice 37 'Existing Phoenix tunnels:'
+        render_tunnels
+        option 0 'Back'
+        printf '\n'
     done
 }
 manage_action() {
@@ -852,7 +861,7 @@ manage_menu() {
                     1) lock_action create_iran ;;
                     2) lock_action create_kharej ;;
                     0) continue ;;
-                    *) notice 33 'Invalid option.'; pause; continue ;;
+                    *) invalid_choice; continue ;;
                 esac ;;
             2) lock_action manage_action restart ;;
             3) lock_action manage_action stop ;;
@@ -863,7 +872,7 @@ manage_menu() {
             8) (set -e; manage_action check) ;;
             9) (set -e; manage_action status) ;;
             10) (set -e; manage_action code) ;;
-            *) notice 33 'Invalid option.'; pause; continue ;;
+            *) invalid_choice; continue ;;
         esac
         action_status=$?
         ((action_status == 2)) || pause
@@ -886,7 +895,7 @@ menu() {
             1) lock_action install_core; pause ;;
             2) manage_menu ;;
             3) lock_action remove_core; pause ;;
-            *) notice 33 'Invalid option.'; pause ;;
+            *) invalid_choice ;;
         esac
     done
 }
