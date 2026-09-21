@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-28
+PHX_REV=standalone-29
 PHX_JOURNAL_ROOT=/etc/systemd
 # Core release is resolved from GitHub on every installation.
 PHX_BASE=/opt/phoenix-tunnel
@@ -367,7 +367,7 @@ install_core() (
         *) fail 'Supported architectures: amd64, arm64'; exit 1 ;;
     esac
     install_dependencies || exit 1
-    need curl jq awk unzip sha256sum install mktemp timeout || exit 1
+    need curl jq awk unzip sha256sum install mktemp timeout systemctl readlink stat sleep cmp || exit 1
     notice 36 'Checking GitHub release...'
     PHX_RELEASE_METADATA=$(resolve_core_release) || { fail 'Cannot check GitHub releases. Core unchanged.'; exit 1; }
     PHX_VERSION=$(jq -er '.tag_name' <<< "$PHX_RELEASE_METADATA") || exit 1
@@ -409,10 +409,54 @@ install_core() (
     [[ $reported == "phoenix ${PHX_VERSION#v} "* ]] || { fail 'Unexpected core version'; exit 1; }
     install -m 0644 "$tmp/LICENSE" "$PHX_BASE/core/LICENSE" || exit 1
     install -m 0644 "$tmp/THIRD-PARTY-LICENSES.json" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json" || exit 1
-    mv -fT "$tmp/phoenix" "$(core)" || exit 1
+    if ! cmp -s "$tmp/phoenix" "$(core)"; then
+        mv -fT "$tmp/phoenix" "$(core)" || exit 1
+    else
+        chmod 0755 "$(core)" || exit 1
+    fi
     notice 32 "Phoenix ${PHX_VERSION#v} installed."
-    report_restart_needed
+    phoenix_restart_updated_core "$(core)"
 )
+phoenix_restart_updated_core() {
+    local binary=$1 units unit state pid executable disk running failed=0 attempt
+    disk=$(stat -Lc '%d:%i' -- "$binary") || return 1
+    units=$(systemctl list-units --type=service --state=active --no-legend --plain --no-pager 'phoenix*.service') || return 1
+    while read -r unit _; do
+        [[ -n $unit ]] || continue
+        [[ $unit =~ ^phoenix[-a-zA-Z0-9_.@]+\.service$ ]] || continue
+        state=$(systemctl show "$unit" -p ActiveState --value) || { failed=1; continue; }
+        [[ $state == active ]] || continue
+        pid=$(systemctl show "$unit" -p MainPID --value) || { failed=1; continue; }
+        [[ $pid =~ ^[1-9][0-9]*$ ]] || { printf 'Phoenix: Cannot inspect %s\n' "$unit" >&2; failed=1; continue; }
+        executable=$(readlink -- "/proc/$pid/exe") || { failed=1; continue; }
+        [[ ${executable% (deleted)} == "$binary" ]] || continue
+        running=$(stat -Lc '%d:%i' -- "/proc/$pid/exe") || { failed=1; continue; }
+        [[ $running != "$disk" ]] || continue
+        # Do not start a service that was stopped after enumeration.
+        printf 'Restarting %s to load the updated core...\n' "$unit"
+        if ! timeout 45s systemctl try-restart "$unit"; then
+            printf 'Phoenix: Restart failed: %s; inspect its status/logs.\n' "$unit" >&2
+            failed=1; continue
+        fi
+        for ((attempt=0; attempt<5; attempt++)); do
+            running=''
+            state=$(systemctl show "$unit" -p ActiveState --value) || state=unknown
+            pid=$(systemctl show "$unit" -p MainPID --value) || pid=0
+            if [[ $state == active && $pid =~ ^[1-9][0-9]*$ ]]; then
+                running=$(stat -Lc '%d:%i' -- "/proc/$pid/exe") || running=''
+                [[ $running != "$disk" ]] || break
+            fi
+            sleep 1
+        done
+        if [[ $state == active && $running == "$disk" ]]; then
+            printf 'Updated core running: %s\n' "$unit"
+        else
+            printf 'Phoenix: New core not confirmed for %s; inspect its status/logs.\n' "$unit" >&2
+            failed=1
+        fi
+    done <<< "$units"
+    return "$failed"
+}
 running_core_changed() {
     local pid=$1 disk running
     [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
