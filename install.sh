@@ -2,9 +2,9 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-27
+PHX_REV=standalone-28
 PHX_JOURNAL_ROOT=/etc/systemd
-PHX_VERSION=v0.1.0-dev.69
+# Core release is resolved from GitHub on every installation.
 PHX_BASE=/opt/phoenix-tunnel
 PHX_SAVE=/root/install.sh
 PHX_UNITS=/etc/systemd/system
@@ -45,7 +45,7 @@ quiet_package_step() (
 missing_dependency_packages() {
     local entry cmd package
     local -A missing=()
-    for entry in curl:curl jq:jq openssl:openssl flock:util-linux ss:iproute2 \
+    for entry in unzip:unzip awk:mawk curl:curl jq:jq openssl:openssl flock:util-linux ss:iproute2 \
         systemctl:systemd journalctl:systemd grep:grep \
         update-ca-certificates:ca-certificates \
         base32:coreutils tr:coreutils sha256sum:coreutils timeout:coreutils \
@@ -56,7 +56,7 @@ missing_dependency_packages() {
         command -v "$cmd" >/dev/null 2>&1 || missing[$package]=1
     done
     ca_ready || missing[ca-certificates]=1
-    for package in curl jq openssl util-linux iproute2 systemd grep ca-certificates coreutils; do
+    for package in unzip mawk curl jq openssl util-linux iproute2 systemd grep ca-certificates coreutils; do
         [[ ! -v missing[$package] ]] || printf '%s\n' "$package"
     done
 }
@@ -249,17 +249,37 @@ read_core_version() {
     [[ -n $PHX_CORE_INSTALLED ]]
 }
 core_ready() { read_core_version; }
-release_version_valid() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+(-dev\.[0-9]+)?$ ]]; }
+release_version_valid() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z][0-9A-Za-z.+-]*)?$ ]]; }
+resolve_core_release() {
+    local page batch count candidate release=null
+    for ((page=1; page<=20; page++)); do
+        batch=$(curl --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 5 --max-time 20 --max-filesize 8388608 \
+            "https://api.github.com/repos/realerfiw/PhoenixTunnel/releases?per_page=100&page=$page") || return 1
+        count=$(jq -er 'if type == "array" then length else error("Invalid release list") end' <<< "$batch") || return 1
+        candidate=$(jq -c '[.[] | select(.draft == false and (.published_at | type == "string"))] | max_by(.published_at)' <<< "$batch") || return 1
+        release=$(jq -cn --argjson a "$release" --argjson b "$candidate" '[$a,$b] | map(select(. != null)) | max_by(.published_at)') || return 1
+        ((count == 100)) || break
+    done
+    ((page <= 20)) || return 1
+    jq -e '.tag_name | type == "string"' <<< "$release" >/dev/null || return 1
+    printf '%s\n' "$release"
+}
 latest_core_release() {
-    # /latest excludes development releases. Never download a core from this response.
-    curl --proto '=https' -fsS --connect-timeout 1 --max-time 2 --max-filesize 262144 \
-        'https://api.github.com/repos/realerfiw/PhoenixTunnel/releases?per_page=30' 2>/dev/null |
-        jq -er '[.[] | select(.draft == false and .published_at != null) |
-          .tag_name | ltrimstr("v") | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+(-dev\\.[0-9]+)?$")) |
-          . as $version | capture("^(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)(-dev\\.(?<dev>[0-9]+))?$") |
-          {version:$version,key:[(.major|tonumber),(.minor|tonumber),(.patch|tonumber),
-            (if .dev==null then 1 else 0 end),((.dev // "0")|tonumber)]}] |
-          sort_by(.key) | last | .version // empty' 2>/dev/null
+    local release tag
+    release=$(resolve_core_release) || return 1
+    tag=$(jq -er '.tag_name' <<< "$release") || return 1
+    release_version_valid "${tag#v}" || return 1
+    printf '%s\n' "${tag#v}"
+}
+release_asset_exists() {
+    jq -e --arg name "$1" --arg url "$PHX_RELEASE/$PHX_VERSION/$1" \
+        'any(.assets[]?; .name == $name and .state == "uploaded" and .browser_download_url == $url)' <<< "$PHX_RELEASE_METADATA" >/dev/null
+}
+release_digest() {
+    local digest
+    digest=$(awk -v name="$2" '{sub(/\r$/, "", $0)} $2 == name || $2 == "*" name {print $1}' "$1") || return 1
+    [[ $digest =~ ^[a-fA-F0-9]{64}$ ]] || { fail "Missing or ambiguous checksum: $2"; return 1; }
+    printf '%s\n' "$digest"
 }
 version_key() {
     local version=$1 main=${1%%-*} stable=1 dev=0
@@ -268,7 +288,7 @@ version_key() {
 }
 refresh_release_status() {
     local latest=''
-    # Resolve before rendering. HTTPS lookup is bounded to two seconds.
+    # Display may use a short-lived cache; installation always resolves afresh.
     if [[ ! -v PHX_RELEASE_CHECKED ]] || ((SECONDS - PHX_RELEASE_CHECKED >= 300)); then
         PHX_RELEASE_CHECKED=$SECONDS
         PHX_LATEST_CORE=''
@@ -289,7 +309,6 @@ core_status() {
             newest=$(printf '%s\n%s\n' "$(version_key "$installed")" "$(version_key "$latest")" | sort -V | tail -n 1)
             if [[ $newest == "$(version_key "$latest")" ]]; then
                 label="Update available: $latest"
-                [[ $latest == "${PHX_VERSION#v}" ]] || label+=' (update menu first)'
             else label='Newer than latest'; color=36
             fi
         fi
@@ -338,59 +357,62 @@ save_menu() (
     chmod 0755 "$staged"
     mv -fT -- "$staged" "$PHX_SAVE"
 )
-install_core() {
+install_core() (
+    set -e
     heading 'Install / update Phoenix core'
-    local arch asset digest tmp reported destination
+    local arch asset digest tmp reported destination PHX_VERSION PHX_RELEASE_METADATA license_digest
     case $(uname -m) in
-        x86_64|amd64) arch=amd64; digest=e1504be2242ca00992541dd31367b5335238d27db938d232b0fc9cc33cce4764 ;;
-        aarch64|arm64) arch=arm64; digest=45a9265a1ab740a7d0f4f9278afee875bd6a7ca30606b23ec7be5141e3e3c871 ;;
-        *) fail 'Supported architectures: amd64, arm64'; return 1 ;;
+        x86_64|amd64) arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *) fail 'Supported architectures: amd64, arm64'; exit 1 ;;
     esac
-    install_dependencies || return 1
-    if read_core_version; then
-        local newest
-        newest=$(printf '%s\n%s\n' "$(version_key "$PHX_CORE_INSTALLED")" "$(version_key "${PHX_VERSION#v}")" | sort -V | tail -n 1)
-        if [[ $PHX_CORE_INSTALLED != "${PHX_VERSION#v}" && $newest == "$(version_key "$PHX_CORE_INSTALLED")" ]]; then
-            fail "Installed $PHX_CORE_INSTALLED is newer than ${PHX_VERSION#v}. Update the menu first; core unchanged."
-            return 1
-        fi
-    fi
-    need curl sha256sum install mktemp timeout
-    layout
-    # Selecting Install / update core is the user's confirmation.
-    for destination in "$(core)" "$PHX_BASE/core/LICENSE" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"; do
-        [[ ! -L $destination && ( ! -e $destination || -f $destination ) ]] ||
-            { fail "Unsafe core destination: $destination"; return 1; }
-    done
-    if core_ready && [[ $PHX_CORE_INSTALLED == "${PHX_VERSION#v}" ]] &&
-        printf '%s  %s\n' "$digest" "$(core)" \
-          4ac2246b8a312640bc5da2a3d57c81dec1bfe813d2b2e5884883aaf95e753de7 "$PHX_BASE/core/LICENSE" \
-          d8fe863575b7eab50193c578392aadb8c3c6c6c6a312f2548b084e27588cb5f1 "$PHX_BASE/core/THIRD-PARTY-LICENSES.json" |
-          sha256sum --check --strict --quiet - 2>/dev/null; then
-        notice 32 "Phoenix ${PHX_VERSION#v} already installed and verified."
-        report_restart_needed
-        return 0
-    fi
-    tmp=$(mktemp -d "$PHX_BASE/core/.download.XXXXXXXX")
-    PHX_TEMP=$tmp; trap 'rm -rf -- "$PHX_TEMP"' EXIT
+    install_dependencies || exit 1
+    need curl jq awk unzip sha256sum install mktemp timeout || exit 1
+    notice 36 'Checking GitHub release...'
+    PHX_RELEASE_METADATA=$(resolve_core_release) || { fail 'Cannot check GitHub releases. Core unchanged.'; exit 1; }
+    PHX_VERSION=$(jq -er '.tag_name' <<< "$PHX_RELEASE_METADATA") || exit 1
+    release_version_valid "${PHX_VERSION#v}" || { fail 'Invalid release version.'; exit 1; }
     asset=phoenix-linux-$arch
-    notice 36 'Downloading core...'
-    fetch "$PHX_RELEASE/$PHX_VERSION/$asset" "$tmp/phoenix"
-    printf '%s  %s\n' "$digest" "$tmp/phoenix" | sha256sum --check --strict --quiet -
-    fetch "$PHX_RELEASE/$PHX_VERSION/LICENSE" "$tmp/LICENSE"
-    fetch "$PHX_RELEASE/$PHX_VERSION/THIRD-PARTY-LICENSES-linux-$arch.json" "$tmp/THIRD-PARTY-LICENSES.json"
-    notice 36 'Verifying files...'
-    printf '%s  %s\n' 4ac2246b8a312640bc5da2a3d57c81dec1bfe813d2b2e5884883aaf95e753de7 "$tmp/LICENSE" d8fe863575b7eab50193c578392aadb8c3c6c6c6a312f2548b084e27588cb5f1 "$tmp/THIRD-PARTY-LICENSES.json" | sha256sum --check --strict --quiet -
-    chmod 0755 "$tmp/phoenix"
-    reported=$(timeout 10s "$tmp/phoenix" version)
-    [[ $reported == "phoenix ${PHX_VERSION#v} "* ]] || { fail 'Unexpected core version'; return 1; }
-    # Rename, never truncate an executable that an existing service may be using.
-    mv -fT "$tmp/phoenix" "$(core)"
-    install -m 0644 "$tmp/LICENSE" "$PHX_BASE/core/LICENSE"
-    install -m 0644 "$tmp/THIRD-PARTY-LICENSES.json" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"
+    release_asset_exists "$asset" && release_asset_exists SHA256SUMS || {
+        fail 'Newest release is missing required files. Core unchanged.'; exit 1;
+    }
+    layout || exit 1
+    for destination in "$(core)" "$PHX_BASE/core/LICENSE" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json"; do
+        [[ ! -L $destination && ( ! -e $destination || -f $destination ) ]] || { fail "Unsafe core destination: $destination"; exit 1; }
+    done
+    tmp=$(mktemp -d "$PHX_BASE/core/.download.XXXXXXXX") || exit 1
+    trap 'rm -rf -- "$tmp"' EXIT
+    fetch "$PHX_RELEASE/$PHX_VERSION/SHA256SUMS" "$tmp/SHA256SUMS" || exit 1
+    digest=$(release_digest "$tmp/SHA256SUMS" "$asset") || exit 1
+    notice 36 "Downloading Phoenix ${PHX_VERSION#v}..."
+    fetch "$PHX_RELEASE/$PHX_VERSION/$asset" "$tmp/phoenix" || exit 1
+    printf '%s  %s\n' "$digest" "$tmp/phoenix" | sha256sum --check --strict --quiet - || exit 1
+    if release_asset_exists LICENSES.zip; then
+        license_digest=$(release_digest "$tmp/SHA256SUMS" LICENSES.zip) || exit 1
+        fetch "$PHX_RELEASE/$PHX_VERSION/LICENSES.zip" "$tmp/LICENSES.zip" || exit 1
+        printf '%s  %s\n' "$license_digest" "$tmp/LICENSES.zip" | sha256sum --check --strict --quiet - || exit 1
+        # Extract only known entries to explicit paths; never unpack archive paths.
+        unzip -p "$tmp/LICENSES.zip" LICENSE > "$tmp/LICENSE" || exit 1
+        unzip -p "$tmp/LICENSES.zip" "THIRD-PARTY-LICENSES-linux-$arch.json" > "$tmp/THIRD-PARTY-LICENSES.json" || exit 1
+    else
+        for destination in LICENSE "THIRD-PARTY-LICENSES-linux-$arch.json"; do
+            release_asset_exists "$destination" || { fail 'Newest release is missing licenses.'; exit 1; }
+            license_digest=$(release_digest "$tmp/SHA256SUMS" "$destination") || exit 1
+            fetch "$PHX_RELEASE/$PHX_VERSION/$destination" "$tmp/$destination" || exit 1
+            printf '%s  %s\n' "$license_digest" "$tmp/$destination" | sha256sum --check --strict --quiet - || exit 1
+        done
+        mv "$tmp/THIRD-PARTY-LICENSES-linux-$arch.json" "$tmp/THIRD-PARTY-LICENSES.json" || exit 1
+    fi
+    [[ -s $tmp/LICENSE && -s $tmp/THIRD-PARTY-LICENSES.json ]] || exit 1
+    chmod 0755 "$tmp/phoenix" || exit 1
+    reported=$(timeout 10s "$tmp/phoenix" version) || exit 1
+    [[ $reported == "phoenix ${PHX_VERSION#v} "* ]] || { fail 'Unexpected core version'; exit 1; }
+    install -m 0644 "$tmp/LICENSE" "$PHX_BASE/core/LICENSE" || exit 1
+    install -m 0644 "$tmp/THIRD-PARTY-LICENSES.json" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json" || exit 1
+    mv -fT "$tmp/phoenix" "$(core)" || exit 1
     notice 32 "Phoenix ${PHX_VERSION#v} installed."
     report_restart_needed
-}
+)
 running_core_changed() {
     local pid=$1 disk running
     [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
