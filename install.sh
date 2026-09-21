@@ -2,7 +2,7 @@
 # Phoenix standalone manager. No external tunnel-manager code or runtime dependencies.
 # PHOENIX_STANDALONE_MENU_V1
 set -uo pipefail
-PHX_REV=standalone-29
+PHX_REV=standalone-30
 PHX_JOURNAL_ROOT=/etc/systemd
 # Core release is resolved from GitHub on every installation.
 PHX_BASE=/opt/phoenix-tunnel
@@ -360,14 +360,14 @@ save_menu() (
 install_core() (
     set -e
     heading 'Install / update Phoenix core'
-    local arch asset digest tmp reported destination PHX_VERSION PHX_RELEASE_METADATA license_digest
+    local arch asset digest tmp reported destination PHX_VERSION PHX_RELEASE_METADATA license_digest installed_inode upgrade_status=0
     case $(uname -m) in
         x86_64|amd64) arch=amd64 ;;
         aarch64|arm64) arch=arm64 ;;
         *) fail 'Supported architectures: amd64, arm64'; exit 1 ;;
     esac
     install_dependencies || exit 1
-    need curl jq awk unzip sha256sum install mktemp timeout systemctl readlink stat sleep cmp || exit 1
+    need curl jq awk unzip sha256sum install mktemp timeout systemctl readlink stat sleep cmp ln || exit 1
     notice 36 'Checking GitHub release...'
     PHX_RELEASE_METADATA=$(resolve_core_release) || { fail 'Cannot check GitHub releases. Core unchanged.'; exit 1; }
     PHX_VERSION=$(jq -er '.tag_name' <<< "$PHX_RELEASE_METADATA") || exit 1
@@ -407,55 +407,134 @@ install_core() (
     chmod 0755 "$tmp/phoenix" || exit 1
     reported=$(timeout 10s "$tmp/phoenix" version) || exit 1
     [[ $reported == "phoenix ${PHX_VERSION#v} "* ]] || { fail 'Unexpected core version'; exit 1; }
-    install -m 0644 "$tmp/LICENSE" "$PHX_BASE/core/LICENSE" || exit 1
-    install -m 0644 "$tmp/THIRD-PARTY-LICENSES.json" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json" || exit 1
     if ! cmp -s "$tmp/phoenix" "$(core)"; then
+        if [[ -f $(core) ]]; then ln -- "$(core)" "$tmp/previous-core" || exit 1; fi
         mv -fT "$tmp/phoenix" "$(core)" || exit 1
     else
         chmod 0755 "$(core)" || exit 1
     fi
+    installed_inode=$(stat -Lc '%d:%i' -- "$(core)") || exit 1
+    phoenix_restart_updated_core "$(core)" "$tmp/previous-core" || upgrade_status=$?
+    # Keep previous license inventory if the binary was rolled back.
+    if [[ $(stat -Lc '%d:%i' -- "$(core)") == "$installed_inode" ]]; then
+        install -m 0644 "$tmp/LICENSE" "$PHX_BASE/core/LICENSE" || exit 1
+        install -m 0644 "$tmp/THIRD-PARTY-LICENSES.json" "$PHX_BASE/core/THIRD-PARTY-LICENSES.json" || exit 1
+    fi
+    (( upgrade_status == 0 )) || exit "$upgrade_status"
     notice 32 "Phoenix ${PHX_VERSION#v} installed."
-    phoenix_restart_updated_core "$(core)"
 )
+# Embedded verbatim in both installers; no runtime sourcing is required.
+phoenix_confirm_core_crash() {
+    local unit=$1 previous_start=$2 snapshot first='' attempt key value state result code status started
+    [[ $previous_start =~ ^[1-9][0-9]*$ ]] || return 1
+    for attempt in 1 2; do
+        snapshot=$(systemctl show "$unit" -p ActiveState -p Result -p ExecMainCode -p ExecMainStatus -p ExecMainStartTimestampMonotonic) || return 1
+        state='' result='' code='' status='' started=''
+        while IFS='=' read -r key value; do
+            case $key in
+                ActiveState) state=$value;; Result) result=$value;;
+                ExecMainCode) code=$value;; ExecMainStatus) status=$value;;
+                ExecMainStartTimestampMonotonic) started=$value;;
+            esac
+        done <<< "$snapshot"
+        [[ $state == failed || $state == activating ]] || return 1
+        [[ $result == core-dump || $result == signal ]] || return 1
+        [[ $code == 2 || $code == 3 ]] || return 1
+        # SIGILL, SIGABRT, SIGBUS, SIGFPE, SIGSEGV only. Never OOM/SIGKILL/TERM.
+        [[ $status =~ ^(4|6|7|8|11)$ ]] || return 1
+        [[ $started =~ ^[1-9][0-9]*$ ]] && (( started > previous_start )) || return 1
+        if [[ $attempt == 1 ]]; then first=$snapshot; sleep 1
+        else [[ $snapshot == "$first" ]] || return 1; fi
+    done
+    PHOENIX_CONFIRMED_CRASH_START=$started
+}
 phoenix_restart_updated_core() {
-    local binary=$1 units unit state pid executable disk running failed=0 attempt
+    local binary=$1 backup=${2:-} units unit state pid executable disk running failed=0 attempt stable old_start old_inode='' crash_unit='' backup_inode='' confirmed_failures last_pid
+    local -a touched=()
     disk=$(stat -Lc '%d:%i' -- "$binary") || return 1
+    if [[ -n $backup && -f $backup && ! -L $backup ]]; then
+        backup_inode=$(stat -Lc '%d:%i' -- "$backup") || return 1
+    fi
     units=$(systemctl list-units --type=service --state=active --no-legend --plain --no-pager 'phoenix*.service') || return 1
     while read -r unit _; do
-        [[ -n $unit ]] || continue
         [[ $unit =~ ^phoenix[-a-zA-Z0-9_.@]+\.service$ ]] || continue
         state=$(systemctl show "$unit" -p ActiveState --value) || { failed=1; continue; }
         [[ $state == active ]] || continue
         pid=$(systemctl show "$unit" -p MainPID --value) || { failed=1; continue; }
-        [[ $pid =~ ^[1-9][0-9]*$ ]] || { printf 'Phoenix: Cannot inspect %s\n' "$unit" >&2; failed=1; continue; }
+        [[ $pid =~ ^[1-9][0-9]*$ ]] || { failed=1; continue; }
         executable=$(readlink -- "/proc/$pid/exe") || { failed=1; continue; }
         [[ ${executable% (deleted)} == "$binary" ]] || continue
-        running=$(stat -Lc '%d:%i' -- "/proc/$pid/exe") || { failed=1; continue; }
-        [[ $running != "$disk" ]] || continue
-        # Do not start a service that was stopped after enumeration.
+        old_inode=$(stat -Lc '%d:%i' -- "/proc/$pid/exe") || { failed=1; continue; }
+        [[ $old_inode != "$disk" ]] || continue
+        old_start=$(systemctl show "$unit" -p ExecMainStartTimestampMonotonic --value) || old_start=''
+        touched+=("$unit")
         printf 'Restarting %s to load the updated core...\n' "$unit"
         if ! timeout 45s systemctl try-restart "$unit"; then
-            printf 'Phoenix: Restart failed: %s; inspect its status/logs.\n' "$unit" >&2
-            failed=1; continue
+            printf 'Phoenix: Restart command failed for %s; checking process state.\n' "$unit" >&2
         fi
-        for ((attempt=0; attempt<5; attempt++)); do
+        stable=0 confirmed_failures=0 last_pid=0
+        for ((attempt=0; attempt<10; attempt++)); do
             running=''
             state=$(systemctl show "$unit" -p ActiveState --value) || state=unknown
             pid=$(systemctl show "$unit" -p MainPID --value) || pid=0
             if [[ $state == active && $pid =~ ^[1-9][0-9]*$ ]]; then
                 running=$(stat -Lc '%d:%i' -- "/proc/$pid/exe") || running=''
-                [[ $running != "$disk" ]] || break
+            fi
+            if [[ $running == "$disk" ]]; then
+                if [[ $pid == "$last_pid" ]]; then stable=$((stable+1)); else stable=1; fi
+            else stable=0; fi
+            last_pid=$pid
+            (( stable >= 3 )) && break
+            if [[ -n $backup_inode && $old_inode == "$backup_inode" ]] && phoenix_confirm_core_crash "$unit" "$old_start"; then
+                confirmed_failures=$((confirmed_failures+1))
+                if (( confirmed_failures >= 2 )); then crash_unit=$unit; break; fi
+                # One crash can be transient. Require another distinct failed
+                # execution before restoring old code; never probe connectivity.
+                old_start=$PHOENIX_CONFIRMED_CRASH_START
+                state=$(systemctl show "$unit" -p ActiveState --value) || state=unknown
+                if [[ $state == failed || $state == activating ]]; then
+                    printf 'Phoenix: Startup crash in %s; retrying new core once before deciding.\n' "$unit" >&2
+                    timeout 45s systemctl restart "$unit" || true
+                fi
             fi
             sleep 1
         done
-        if [[ $state == active && $running == "$disk" ]]; then
+        [[ -z $crash_unit ]] || break
+        if (( stable >= 3 )); then
             printf 'Updated core running: %s\n' "$unit"
         else
-            printf 'Phoenix: New core not confirmed for %s; inspect its status/logs.\n' "$unit" >&2
+            printf 'Phoenix: New core not confirmed for %s. No proven core crash; no automatic rollback.\n' "$unit" >&2
             failed=1
         fi
     done <<< "$units"
-    return "$failed"
+    [[ -n $crash_unit ]] || return "$failed"
+    # A hard link retains the exact previously running inode, not just a version label.
+    [[ $(stat -Lc '%d:%i' -- "$binary") == "$disk" && $(stat -Lc '%d:%i' -- "$backup") == "$backup_inode" ]] || return 1
+    printf 'Phoenix: Confirmed startup crash in %s. Restoring previous core.\n' "$crash_unit" >&2
+    mv -fT -- "$backup" "$binary" || return 1
+    for unit in "${touched[@]}"; do
+        state=$(systemctl show "$unit" -p ActiveState --value) || continue
+        # Do not undo an explicit user stop. Only recover the failed unit or
+        # services from this transaction which are still executing the new inode.
+        [[ $state != inactive && $state != deactivating ]] || continue
+        if [[ $unit != "$crash_unit" ]]; then
+            pid=$(systemctl show "$unit" -p MainPID --value) || continue
+            [[ $pid =~ ^[1-9][0-9]*$ ]] || continue
+            [[ $(stat -Lc '%d:%i' -- "/proc/$pid/exe") == "$disk" ]] || continue
+        fi
+        if ! timeout 45s systemctl restart "$unit"; then
+            printf 'Phoenix: Recovery restart failed: %s\n' "$unit" >&2; continue
+        fi
+        pid=$(systemctl show "$unit" -p MainPID --value) || pid=0
+        state=$(systemctl show "$unit" -p ActiveState --value) || state=unknown
+        if [[ $state == active && $pid =~ ^[1-9][0-9]*$ && $(stat -Lc '%d:%i' -- "/proc/$pid/exe") == "$backup_inode" ]]; then
+            printf 'Previous core restored: %s\n' "$unit"
+        else
+            printf 'Phoenix: Recovery not confirmed: %s; inspect its logs.\n' "$unit" >&2
+        fi
+    done
+    # Rollback is not a successful update; never report the new release installed.
+    return 1
 }
 running_core_changed() {
     local pid=$1 disk running
