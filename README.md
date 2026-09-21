@@ -1,115 +1,85 @@
 # Phoenix Tunnel
 
-Phoenix Tunnel core for Linux.
+Reverse tunneling for TCP and UDP services between Linux servers.
 
-Phoenix Tunnel creates an authenticated connection between two Linux hosts and
-forwards selected services through that connection. One endpoint runs as the
-server/listener and the other as the client/connector; each forwarded service
-is defined by a static mapping from a listening address to a target address.
+Phoenix connects two servers through an authenticated, encrypted tunnel and
+forwards selected ports to services on the remote side. It is designed for
+explicit port mappings: you choose which ports to expose and where their
+traffic should go.
 
-## Features
+## How it works
 
-- TCP forwarding over an authenticated HTTP/2 and TLS 1.3 carrier.
-- UDP forwarding over HTTP/2 or HTTP/3 and QUIC DATAGRAM.
-- `auto` carrier selection, with explicit `h2` and `h3` modes when needed.
-- Multiple independent mappings and separate tunnel processes.
-- Session recovery for eligible TCP flows after a short carrier interruption.
+The **Kharej** server initiates the tunnel connection to **Iran**. Users connect
+to a forwarded port on Iran, and Phoenix carries that traffic to the configured
+destination on Kharej. Responses travel back through the tunnel.
 
-Phoenix is designed for configured private mappings, not as an open proxy.
+```text
+User → Iran public port → Phoenix tunnel → Kharej destination service
+```
 
-## Download
+- **Iran — server/listener:** accepts the tunnel connection and exposes the
+  forwarded ports.
+- **Kharej — client/connector:** connects to Iran and reaches the destination
+  services, either locally or at a configured reachable address.
 
-Download the latest build from [Releases](https://github.com/realerfiw/PhoenixTunnel/releases).
+Phoenix transports your service traffic; it does not replace the destination
+application. That application must be running on the configured target port.
 
-- `phoenix-linux-amd64` — x86-64
-- `phoenix-linux-arm64` — ARM64
+## Capabilities
 
-Download `SHA256SUMS` and the matching license files with the core.
+- **TCP forwarding** over HTTP/2 with TLS 1.3.
+- **UDP forwarding** over HTTP/2 or HTTP/3 with QUIC DATAGRAM.
+- **Automatic transport selection**, or explicit `h2` / `h3` configuration.
+- **Multiple port mappings** in one tunnel and multiple independent tunnels
+  on the same host.
+- **Authenticated peers** with TLS certificate verification.
+- **Session recovery** for eligible TCP connections after short transport
+  interruptions, within the configured recovery limits.
 
-## Setup
+Recovery is not a guarantee of uninterrupted connections: prolonged outages
+or a peer process restart can still break active flows.
 
-Run as root on a Linux host with Bash and systemd:
+## Transports
 
-```sh
+| Mode | Forwarded traffic | Transport |
+| --- | --- | --- |
+| `auto` | TCP and UDP | TCP uses H2; UDP can use H3 with H2 fallback |
+| `h2` | TCP and UDP | HTTP/2 over TCP and TLS |
+| `h3` | UDP only | HTTP/3 over QUIC |
+
+Choose `auto` for the general setup, or select a specific transport when the
+network requires it. H3 needs UDP connectivity between the two servers.
+
+## Quick start
+
+On both servers, run as root:
+
+```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/realerfiw/PhoenixTunnel/main/install.sh)
 ```
 
-The command opens the Phoenix menu; it does not automatically install the core
-or change any tunnel. The menu is saved as `/root/install.sh` and can be reopened
-with `bash /root/install.sh`.
+The command opens the installation menu.
 
-1. Choose **Install / update core** on both hosts.
-2. On Iran, choose **Manage tunnels > Create tunnel > Iran**. Enter the tunnel
-   address, transport and forwarded ports.
-3. Copy the private connection code shown at the end.
-4. On Kharej, choose **Create tunnel > Kharej** and paste the code.
+1. Select **Install / update core** on both servers.
+2. On Iran, select **Manage tunnels → Create tunnel → Iran** and enter the
+   public address, tunnel port and service port mappings.
+3. Copy the private connection code.
+4. On Kharej, select **Manage tunnels → Create tunnel → Kharej** and paste it.
 
-Creating a tunnel starts its service and enables it after reboot. Each tunnel
-is named automatically by role, carrier and tunnel port (for example,
-`iran-auto-9090`), with a numeric suffix when needed. Each has its own
-configuration. Manage tunnels provides restart, stop,
-remove, logs, details, validation and status actions.
-Its main screen lists installed tunnels with their local service status
-(`UP`, `DOWN`, `INCOMPLETE` or `UNKNOWN`). Back and Exit use `0`.
+New tunnels start automatically and are enabled after reboot. Keep the
+connection code private, use matching core versions on both sides, and allow
+the required tunnel and public service ports through your firewall.
 
-Iran tunnel ports are checked against saved Iran listeners/mappings and active
-TCP/UDP listeners; an occupied port prompts for another value. The check is
-repeated before installation. `ss` (iproute2) is installed with missing dependencies.
-Health check reports config validity, service PID and server listener ownership.
-Client socket observations are informational, not proof of authentication or
-end-to-end forwarding; those require a real request through a forwarded port.
+The menu requires Linux, Bash, curl and systemd 245 or newer. Ubuntu/Debian
+dependency installation is handled by **Install / update core**.
 
-Files are kept in:
+## Linux builds
 
-```text
-/root/install.sh
-/opt/phoenix-tunnel/
-  core/phoenix
-  configs/
-```
+Prebuilt cores are available in [Releases](https://github.com/realerfiw/PhoenixTunnel/releases):
 
-The core download is checked against a pinned SHA-256. On Ubuntu/Debian,
-**Install / update core** also installs missing dependencies such as `jq`,
-`openssl`, `curl` and CA certificates through APT. Other distributions need
-the required tools installed manually.
+- `phoenix-linux-amd64` — x86-64 servers
+- `phoenix-linux-arm64` — ARM64 servers
 
-**Remove core** deletes only the core, its license files and empty Phoenix
-directories, after all standalone tunnels have been removed. System packages,
-the saved menu and non-empty configuration directories are kept.
-
-Keep connection codes private. The destination service must be running on
-Kharej, and the selected transport and public ports must be allowed by your
-firewall. Existing installations at other paths are left unchanged.
-
-## Logs
-
-New tunnels use a dedicated `phoenix-standalone` journal namespace. For existing
-standalone tunnels, choose **Restart tunnel** once to apply the policy; this
-briefly interrupts that tunnel, without replacing its configuration.
-
-All standalone Phoenix tunnels on one host share a 100 MiB persistent journal
-budget and three-day retention (20 MiB for runtime storage). Rotation removes
-old entries automatically. Active files and journal overhead mean this is not
-an exact byte-level quota or an exact deletion deadline. System-wide journals
-and old entries in the default journal are not purged or capped by this policy.
-Namespace support requires systemd 245 or newer; unsupported/custom logging
-configurations cause an explicit error before restarting the selected tunnel.
-
-**View logs** displays all retained entries; **View live logs** displays the same
-history and follows new entries. Both include older default-journal entries for
-the selected service. UTC dates, levels, messages and all application fields
-are formatted without event allowlists, priority filters or line-count limits.
-Events use compact single-line headings with details wrapped underneath and no
-blank rows between records. The UTC date appears when it changes; redundant
-application timestamp/level fields are not printed twice. Unknown events,
-plain text and nested metrics are retained, with nested fields expanded into
-readable paths instead of a long JSON blob.
-Recognized structured secret fields are masked, and terminal control characters
-are sanitized; stored journal records are not rewritten. Do not share logs
-publicly without reviewing them for sensitive data.
-
-No duplicate text-log file is created. The dedicated retention policy remains
-after core removal so retained logs continue to age out; OS packages and other
-services are not changed. Records already expired, never emitted by the core,
-or previously suppressed cannot be recovered. Service-level rate suppression
-is disabled for migrated/new tunnels; disk/time retention still applies.
+For manual downloads, verify the core against `SHA256SUMS` and keep the
+accompanying license notices. Builds marked **Pre-release** are development
+versions for testing.
