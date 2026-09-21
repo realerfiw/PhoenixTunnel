@@ -2,6 +2,8 @@
 
 Reverse tunneling for TCP and UDP services between Linux servers.
 
+[How it works](#how-it-works) · [Capabilities](#capabilities) · [Transports](#transports) · [Quick start](#quick-start) · [Linux builds](#linux-builds)
+
 Phoenix connects two servers through an authenticated, encrypted tunnel and
 forwards selected ports to services on the remote side. It is designed for
 explicit port mappings: you choose which ports to expose and where their
